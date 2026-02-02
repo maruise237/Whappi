@@ -201,13 +201,49 @@ The easiest way to run the server and frontend together is using Docker Compose:
    ```bash
    cp .env.example .env
    ```
+   *Note: Make sure to set a secure `TOKEN_ENCRYPTION_KEY`.*
 
-3. **Start the containers:**
+3. **Start the application:**
    ```bash
-   docker-compose up -d --build
+   docker-compose up -d
    ```
 
-The **Backend/API** will be available at `http://localhost:3000` and the **Frontend** at `http://localhost:3001`.
+4. **Access the services:**
+   - **Backend API:** `http://localhost:3000`
+   - **Admin Dashboard:** `http://localhost:3001`
+
+#### Docker Volumes (Persistence)
+The following directories are mounted as volumes to ensure data persistence:
+- `./data`: SQLite database and user data
+- `./auth_info_baileys`: WhatsApp authentication credentials
+- `./sessions`: Active session metadata
+- `./logs`: Application and error logs
+- `./media`: Uploaded media files
+
+### Manual Deployment
+
+#### Prerequisites
+- Node.js (v18 or higher)
+- SQLite3
+- Python 3 (for some native dependencies)
+
+#### Installation
+1. Clone and install root dependencies:
+   ```bash
+   git clone https://github.com/maruise237/Super-Light-Web-WhatsApp-API-Server-main.git
+   cd Super-Light-Web-WhatsApp-API-Server-main
+   npm install
+   ```
+
+2. Install all sub-project dependencies:
+   ```bash
+   npm run install:all
+   ```
+
+3. Start both Backend and Frontend:
+   ```bash
+   npm run dev
+   ```
 
 ### VPS/Cloud Deployment
 - Use the production scripts (`start-production.sh` or `start-production.bat`)
