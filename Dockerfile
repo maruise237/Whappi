@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y \
     make \
     g++ \
     sqlite3 \
+    git \
     && rm -rf /var/lib/apt/lists/*
 
 # Set working directory
