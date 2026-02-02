@@ -5,13 +5,12 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev:backend": "nodemon index.js",
-    "dev:frontend": "cd frontend && npm run dev",
-    "dev": "concurrently \"npm run dev:backend\" \"npm run dev:frontend\"",
-    "build:frontend": "cd frontend && npm run build",
-    "install:all": "npm install && cd frontend && npm install",
+    "dev": "nodemon index.js",
     "test": "jest",
+    "install:smart": "node install-dependencies.js",
     "start-production": "npm run start:prod",
+    "start:prod:unix": "bash start-production.sh",
+    "start:prod:windows": "start-production.bat",
     "start:prod": "node -r dotenv/config index.js"
   },
   "author": "Alucard0x1",
@@ -43,7 +42,6 @@
   },
   "devDependencies": {
     "axios-cookiejar-support": "^6.0.5",
-    "concurrently": "^8.2.2",
     "jest": "^29.7.0",
     "nodemon": "^3.1.9",
     "qrcode-terminal": "^0.12.0",
