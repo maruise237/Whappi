@@ -37,11 +37,13 @@ RUN cd frontend && npm install --legacy-peer-deps
 COPY . .
 
 # Argument for Frontend Build (important for Next.js)
-ARG NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY="pk_test_build_time_placeholder"
+# NOTE: In Dokploy, you MUST add these in the "Build Arguments" section
+ARG NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
 ARG NEXT_PUBLIC_CLERK_SIGN_IN_URL="/login"
 ARG NEXT_PUBLIC_CLERK_SIGN_UP_URL="/register"
 ARG NEXT_PUBLIC_API_URL="/"
 
+# Make arguments available during build
 ENV NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=$NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
 ENV NEXT_PUBLIC_CLERK_SIGN_IN_URL=$NEXT_PUBLIC_CLERK_SIGN_IN_URL
 ENV NEXT_PUBLIC_CLERK_SIGN_UP_URL=$NEXT_PUBLIC_CLERK_SIGN_UP_URL

@@ -9,6 +9,8 @@ import { Suspense } from "react";
 
 const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
 
+const publishableKey = process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY;
+
 export const metadata: Metadata = {
   title: "Whappi | Passerelle WhatsApp",
   description: "Passerelle API WhatsApp ultra-légère",
@@ -39,7 +41,7 @@ export default function RootLayout({
         />
       </head>
       <body className={`${inter.className} antialiased`} suppressHydrationWarning>
-        <ClerkProvider localization={frFR}>
+        <ClerkProvider localization={frFR} publishableKey={publishableKey}>
           <Suspense fallback={null}>
             <ProgressBar />
           </Suspense>
