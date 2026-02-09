@@ -8,6 +8,45 @@ session_tokens.enc
 # Database
 data/
 whatsapp.db
+src/config/database.sqlite
+
+# Testing & Utility scripts (Root)
+check_activity_logs.js
+check_ai.js
+check_ai_config_kamtech.js
+check_ai_stats.js
+check_ai_stats_kamtech.js
+check_ai_status_simple.js
+check_db.js
+check_db_v2.js
+check_schema.js
+check_sessions_db.js
+check_time.js
+check_user.js
+debug_animator.js
+debug_animator_state.js
+debug_db.js
+debug_links.js
+debug_schema.js
+debug_session_auth.js
+enable_ai_sessions.js
+fix_db_columns.js
+list_sessions.js
+list_tables.js
+read_logs.js
+rename_folder.js
+rename_session.js
+test-ai-generation-flow.js
+test-formatting.js
+test-group-moderation.js
+test_ai_api.js
+test_ai_connection.js
+test_animator.js
+test_animator_logic.js
+test_api_auth.js
+test_final_animation.js
+test_kamtechia.js
+update_kamtechia_ai.js
 
 # User & Security Data
 users.enc

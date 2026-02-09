@@ -19,6 +19,8 @@ import { Badge } from "@/components/ui/badge"
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import { copyToClipboard as copyUtil } from "@/lib/utils"
+import { toast } from "sonner"
 import {
   Table,
   TableBody,
@@ -36,26 +38,31 @@ interface CodeBlockProps {
 function CodeBlock({ code, lang = "bash" }: CodeBlockProps) {
   const [copied, setCopied] = React.useState(false)
 
-  const copyToClipboard = () => {
-    navigator.clipboard.writeText(code)
-    setCopied(true)
-    setTimeout(() => setCopied(false), 2000)
+  const copyToClipboard = async () => {
+    const success = await copyUtil(code)
+    if (success) {
+      setCopied(true)
+      setTimeout(() => setCopied(false), 2000)
+      toast.success("Copié dans le presse-papier")
+    } else {
+      toast.error("Échec de la copie")
+    }
   }
 
   return (
-    <div className="relative group my-4">
-      <div className="absolute top-3 right-3 flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-opacity z-10">
-        <span className="text-[10px] font-bold text-slate-500 uppercase tracking-widest bg-slate-900/50 px-2 py-1 rounded border border-slate-800">
+    <div className="relative group my-6">
+      <div className="absolute top-4 right-4 flex items-center gap-2 opacity-0 group-hover:opacity-100 transition-all duration-300 z-10">
+        <span className="text-[9px] font-black text-primary/70 uppercase tracking-widest bg-background/80 backdrop-blur-md px-3 py-1.5 rounded-lg border-2 border-primary/10 shadow-sm">
           {lang}
         </span>
         <button 
           onClick={copyToClipboard}
-          className="p-1.5 bg-slate-900 border border-slate-800 rounded-md hover:bg-slate-800 transition-colors text-slate-400 hover:text-white"
+          className="p-2 bg-background/80 backdrop-blur-md border-2 border-primary/10 rounded-lg hover:bg-primary/10 hover:border-primary/20 transition-all duration-200 text-muted-foreground hover:text-primary shadow-sm active:scale-90"
         >
-          {copied ? <Check className="w-3.5 h-3.5 text-emerald-500" /> : <Copy className="w-3.5 h-3.5" />}
+          {copied ? <Check className="w-4 h-4 text-emerald-500" /> : <Copy className="w-4 h-4" />}
         </button>
       </div>
-      <ScrollArea className="w-full rounded-lg border border-slate-800 bg-[#0f172a] p-4 font-mono text-sm text-slate-300 leading-relaxed">
+      <ScrollArea className="w-full rounded-lg border-2 border-primary/5 bg-[#0d1117] p-6 font-mono text-[11px] text-slate-300 leading-relaxed shadow-inner">
         <pre className="whitespace-pre">{code}</pre>
       </ScrollArea>
     </div>
@@ -64,67 +71,71 @@ function CodeBlock({ code, lang = "bash" }: CodeBlockProps) {
 
 function Endpoint({ method, path, children }: { method: string, path: string, children: React.ReactNode }) {
   const methodColor = {
-    GET: "bg-emerald-500/10 text-emerald-500 border-emerald-500/20",
-    POST: "bg-sky-500/10 text-sky-500 border-sky-500/20",
-    PUT: "bg-amber-500/10 text-amber-500 border-amber-500/20",
-    DELETE: "bg-red-500/10 text-red-500 border-red-500/20",
+    GET: "bg-emerald-500/10 text-emerald-500 border-emerald-500/20 shadow-[0_0_15px_rgba(16,185,129,0.1)]",
+    POST: "bg-sky-500/10 text-sky-500 border-sky-500/20 shadow-[0_0_15px_rgba(14,165,233,0.1)]",
+    PUT: "bg-amber-500/10 text-amber-500 border-amber-500/20 shadow-[0_0_15px_rgba(245,158,11,0.1)]",
+    DELETE: "bg-red-500/10 text-red-500 border-red-500/20 shadow-[0_0_15px_rgba(239,68,68,0.1)]",
   }[method] || "bg-slate-500/10 text-slate-500 border-slate-500/20"
 
   return (
-    <div className="mb-12 last:mb-0">
-      <div className="flex items-center gap-3 mb-4">
-        <Badge variant="outline" className={`${methodColor} font-bold px-2 py-0.5 rounded text-xs`}>
+    <div className="mb-16 last:mb-0 bg-card/20 backdrop-blur-sm rounded-lg p-8 border-2 border-primary/5 hover:border-primary/10 transition-all duration-200 group">
+      <div className="flex items-center gap-4 mb-6">
+        <Badge variant="outline" className={`${methodColor} font-black px-3 py-1 rounded-lg text-[10px] tracking-[0.2em] border-2`}>
           {method}
         </Badge>
-        <code className="text-sm font-semibold text-foreground bg-muted px-2 py-1 rounded">
+        <code className="text-[11px] font-black text-primary bg-primary/5 px-4 py-2 rounded-lg border-2 border-primary/5 shadow-inner tracking-tight">
           {path}
         </code>
       </div>
-      {children}
+      <div className="space-y-4">
+        {children}
+      </div>
     </div>
   )
 }
 
 export function DocsContent() {
   return (
-    <div className="space-y-12 max-w-5xl mx-auto">
+    <div className="space-y-20 max-w-5xl mx-auto">
       {/* Overview */}
-      <section id="overview" className="scroll-mt-20">
-        <div className="flex items-center gap-2 mb-4">
-          <Book className="w-6 h-6 text-primary" />
-          <h2 className="text-3xl font-bold tracking-tight">Overview</h2>
+      <section id="overview" className="scroll-mt-24">
+        <div className="flex items-center gap-4 mb-8">
+          <div className="p-3 bg-primary/10 rounded-lg shadow-inner">
+            <Book className="w-8 h-8 text-primary" />
+          </div>
+          <h2 className="text-3xl font-black tracking-tight uppercase">Vue d'ensemble</h2>
         </div>
-        <p className="text-muted-foreground text-lg leading-relaxed mb-6">
-          This document provides detailed, developer-focused instructions for using the WhatsApp API. For interactive testing, we recommend using the <strong>Quick Message</strong> tool on the Dashboard.
+        <p className="text-muted-foreground text-sm font-bold leading-relaxed mb-8 uppercase tracking-wide opacity-70">
+          Ce document fournit des instructions détaillées et axées sur les développeurs pour l'utilisation de l'API WhatsApp. Pour des tests interactifs, nous vous recommandons d'utiliser l'outil <strong>Quick Message</strong> sur le tableau de bord.
         </p>
 
-        <Alert className="bg-primary/5 border-primary/20 mb-8">
-          <Info className="h-4 w-4 text-primary" />
-          <AlertTitle className="text-primary font-bold">Base URL configuration</AlertTitle>
-          <AlertDescription className="text-muted-foreground">
-            The base URL format depends on your deployment environment. For production, always use HTTPS.
+        <Alert className="bg-primary/5 border-2 border-primary/10 rounded-lg mb-10 p-6 shadow-inner">
+          <Info className="h-5 w-5 text-primary" />
+          <AlertTitle className="text-primary font-black uppercase tracking-widest text-[11px] mb-2">Configuration de l'URL de base</AlertTitle>
+          <AlertDescription className="text-muted-foreground font-bold text-[10px] uppercase tracking-wider opacity-70">
+            Le format de l'URL de base dépend de votre environnement de déploiement. Pour la production, utilisez toujours HTTPS.
           </AlertDescription>
         </Alert>
 
-        <Card className="border-2 border-primary/10 overflow-hidden">
+        <Card className="border-2 border-primary/5 rounded-lg overflow-hidden bg-card/50 backdrop-blur-md shadow-xl">
           <Table>
-            <TableHeader className="bg-muted/50">
-              <TableRow>
-                <TableHead className="font-bold">Environment</TableHead>
-                <TableHead className="font-bold">V1 API Base URL</TableHead>
-                <TableHead className="font-bold">Legacy API Base URL</TableHead>
+            <TableHeader className="bg-muted/30">
+              <TableRow className="border-b border-muted/20">
+                <TableHead className="font-black uppercase tracking-widest text-[10px] h-14 pl-8">Environnement</TableHead>
+                <TableHead className="font-black uppercase tracking-widest text-[10px] h-14">URL de base API V1</TableHead>
+                <TableHead className="font-black uppercase tracking-widest text-[10px] h-14 pr-8">URL de base API Legacy</TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
-              <TableRow>
-                <TableCell className="font-medium">Local Development</TableCell>
-                <TableCell><code>http://localhost:3000/api/v1</code></TableCell>
-                <TableCell><code>http://localhost:3000/api</code></TableCell>
+              <TableRow className="border-b border-muted/10 last:border-0 hover:bg-primary/5 transition-colors">
+                <TableCell className="font-black uppercase tracking-tight text-[11px] pl-8 py-6">Développement Local</TableCell>
+                <TableCell><code className="bg-primary/5 text-primary px-3 py-1.5 rounded-lg border-2 border-primary/5 font-mono text-[10px]">http://localhost:3000/api/v1</code></TableCell>
+                <TableCell className="pr-8"><code className="bg-muted/50 text-muted-foreground px-3 py-1.5 rounded-lg border-2 border-muted/20 font-mono text-[10px]">http://localhost:3000/api</code></TableCell>
               </TableRow>
-              <TableRow>
-                <TableCell className="font-medium">Production (HTTPS)</TableCell>
-                <TableCell><code>https://api.yourdomain.com/api/v1</code></TableCell>
-                <TableCell><code>https://api.yourdomain.com/api</code></TableCell>
+              <TableRow className="border-b border-muted/10 last:border-0 hover:bg-primary/5 transition-colors">
+                <TableCell className="font-black uppercase tracking-tight text-[11px] pl-8 py-6">Production (HTTPS)</TableCell>
+                <TableCell><code className="bg-primary/5 text-primary px-3 py-1.5 rounded-lg border-2 border-primary/5 font-mono text-[10px]">https://api.votre-domaine.com/api/v1</code></TableCell>
+                <TableCell className="pr-8"><code className="bg-muted/50 text-muted-foreground px-3 py-1.5 rounded-lg border-2 border-muted/20 font-mono text-[10px]">https://api.votre-domaine.com/api</code></TableCell>
               </TableRow>
             </TableBody>
           </Table>
@@ -132,156 +143,165 @@ export function DocsContent() {
       </section>
 
       {/* Authentication */}
-      <section id="authentication" className="scroll-mt-20">
-        <div className="flex items-center gap-2 mb-4">
-          <Lock className="w-6 h-6 text-primary" />
-          <h2 className="text-3xl font-bold tracking-tight">Authentication</h2>
+      <section id="authentication" className="scroll-mt-24">
+        <div className="flex items-center gap-4 mb-8">
+          <div className="p-3 bg-primary/10 rounded-lg shadow-inner">
+            <Lock className="w-8 h-8 text-primary" />
+          </div>
+          <h2 className="text-3xl font-black tracking-tight uppercase">Authentification</h2>
         </div>
-        <p className="text-muted-foreground mb-6">
-          All API requests to the <code>/api/v1/*</code> endpoints must be authenticated using a Bearer Token.
+        <p className="text-muted-foreground text-sm font-bold uppercase tracking-wide opacity-70 mb-8">
+          Toutes les requêtes API vers les points de terminaison <code>/api/v1/*</code> doivent être authentifiées à l'aide d'un jeton Bearer.
         </p>
 
-        <div className="grid gap-6">
-          <Card className="border-2 border-primary/10">
-            <CardHeader>
-              <CardTitle className="text-lg">Bearer Token</CardTitle>
-              <CardDescription>Include the token in your Authorization header for every request.</CardDescription>
+        <div className="grid gap-8">
+          <Card className="border-2 border-primary/10 rounded-lg bg-primary/5 p-8 shadow-inner overflow-hidden relative group">
+            <div className="absolute top-0 right-0 p-8 opacity-5 group-hover:opacity-10 transition-opacity">
+              <Lock className="w-24 h-24" />
+            </div>
+            <CardHeader className="p-0 mb-6">
+              <CardTitle className="text-xl font-black uppercase tracking-tight">Jeton Bearer</CardTitle>
+              <CardDescription className="text-[10px] font-black uppercase tracking-widest opacity-60">Incluez le jeton dans votre en-tête Authorization pour chaque requête.</CardDescription>
             </CardHeader>
-            <CardContent>
-              <CodeBlock code='Authorization: Bearer <your_api_token>' lang="http" />
+            <CardContent className="p-0">
+              <CodeBlock code='Authorization: Bearer <votre_api_token>' lang="http" />
             </CardContent>
           </Card>
         </div>
       </section>
 
       {/* Session Management */}
-      <section id="sessions" className="scroll-mt-20">
-        <div className="flex items-center gap-2 mb-6">
-          <Settings className="w-6 h-6 text-primary" />
-          <h2 className="text-3xl font-bold tracking-tight">Session Management</h2>
+      <section id="sessions" className="scroll-mt-24">
+        <div className="flex items-center gap-4 mb-10">
+          <div className="p-3 bg-primary/10 rounded-lg shadow-inner">
+            <Settings className="w-8 h-8 text-primary" />
+          </div>
+          <h2 className="text-3xl font-black tracking-tight uppercase">Gestion des Sessions</h2>
         </div>
 
         <Endpoint method="POST" path="/sessions">
-          <h4 className="text-xl font-bold mb-2">Create Session</h4>
-          <p className="text-muted-foreground mb-4">
-            Creates a new WhatsApp session with a unique ID. Requires Master API Key or admin authentication.
+          <h4 className="text-xl font-black uppercase tracking-tight mb-3">Créer une Session</h4>
+          <p className="text-muted-foreground text-[11px] font-bold uppercase tracking-widest opacity-70 mb-8 leading-relaxed">
+            Crée une nouvelle session WhatsApp avec un identifiant unique. Nécessite une clé API Master ou une authentification administrateur.
           </p>
           
-          <div className="space-y-4">
-            <h5 className="font-semibold text-sm uppercase tracking-wider text-muted-foreground">Request Body</h5>
-            <CodeBlock code={JSON.stringify({ sessionId: "mySession" }, null, 2)} lang="json" />
+          <div className="space-y-6">
+            <div className="space-y-3">
+              <h5 className="font-black text-[10px] uppercase tracking-[0.2em] text-primary/70 ml-2">Corps de la Requête</h5>
+              <CodeBlock code={JSON.stringify({ sessionId: "maSession" }, null, 2)} lang="json" />
+            </div>
             
-            <h5 className="font-semibold text-sm uppercase tracking-wider text-muted-foreground">Example cURL</h5>
-            <CodeBlock code={`curl -X POST 'http://localhost:3000/api/v1/sessions' \\
--H 'X-Master-Key: your-master-api-key' \\
+            <div className="space-y-3">
+              <h5 className="font-black text-[10px] uppercase tracking-[0.2em] text-primary/70 ml-2">Exemple cURL</h5>
+              <CodeBlock code={`curl -X POST 'http://localhost:3000/api/v1/sessions' \\
+-H 'X-Master-Key: votre-cle-master' \\
 -H 'Content-Type: application/json' \\
--d '{"sessionId": "mySession"}'`} />
+-d '{"sessionId": "maSession"}'`} />
+            </div>
           </div>
         </Endpoint>
 
         <Endpoint method="GET" path="/sessions">
-          <h4 className="text-xl font-bold mb-2">List Sessions</h4>
-          <p className="text-muted-foreground mb-4">
-            Retrieves all active sessions and their current status. No authentication required.
+          <h4 className="text-xl font-black uppercase tracking-tight mb-3">Lister les Sessions</h4>
+          <p className="text-muted-foreground text-[11px] font-bold uppercase tracking-widest opacity-70 mb-8 leading-relaxed">
+            Récupère toutes les sessions actives et leur statut actuel. Aucune authentification requise.
           </p>
           <CodeBlock code={`curl -X GET 'http://localhost:3000/api/v1/sessions'`} />
         </Endpoint>
       </section>
 
       {/* Messaging */}
-      <section id="messaging" className="scroll-mt-20">
-        <div className="flex items-center gap-2 mb-6">
-          <MessageSquare className="w-6 h-6 text-primary" />
-          <h2 className="text-3xl font-bold tracking-tight">Messaging</h2>
+      <section id="messaging" className="scroll-mt-24">
+        <div className="flex items-center gap-4 mb-10">
+          <div className="p-3 bg-primary/10 rounded-lg shadow-inner">
+            <MessageSquare className="w-8 h-8 text-primary" />
+          </div>
+          <h2 className="text-3xl font-black tracking-tight uppercase">Messagerie</h2>
         </div>
 
         <Endpoint method="POST" path="/messages">
-          <h4 className="text-xl font-bold mb-2">Send Message</h4>
-          <p className="text-muted-foreground mb-6">
-            Send various types of messages including text, image, audio, video, and documents.
+          <h4 className="text-xl font-black uppercase tracking-tight mb-3">Envoyer un Message</h4>
+          <p className="text-muted-foreground text-[11px] font-bold uppercase tracking-widest opacity-70 mb-8 leading-relaxed">
+            Envoyez divers types de messages, notamment du texte, des images, de l'audio, de la vidéo et des documents.
           </p>
 
           <Tabs defaultValue="text" className="w-full">
-            <TabsList className="bg-muted/50 p-1 mb-6">
-              <TabsTrigger value="text">Text</TabsTrigger>
-              <TabsTrigger value="image">Image</TabsTrigger>
-              <TabsTrigger value="audio">Audio</TabsTrigger>
-              <TabsTrigger value="video">Video</TabsTrigger>
-              <TabsTrigger value="document">Document</TabsTrigger>
+            <TabsList className="bg-muted/50 p-1.5 h-14 rounded-lg border-2 mb-8 grid grid-cols-5">
+              <TabsTrigger value="text" className="rounded-lg font-black text-[10px] uppercase tracking-widest transition-all duration-200">Texte</TabsTrigger>
+              <TabsTrigger value="image" className="rounded-lg font-black text-[10px] uppercase tracking-widest transition-all duration-200">Image</TabsTrigger>
+              <TabsTrigger value="audio" className="rounded-lg font-black text-[10px] uppercase tracking-widest transition-all duration-200">Audio</TabsTrigger>
+              <TabsTrigger value="video" className="rounded-lg font-black text-[10px] uppercase tracking-widest transition-all duration-200">Vidéo</TabsTrigger>
+              <TabsTrigger value="document" className="rounded-lg font-black text-[10px] uppercase tracking-widest transition-all duration-200">Doc</TabsTrigger>
             </TabsList>
             
-            <TabsContent value="text">
-              <CodeBlock code={`curl -X POST 'http://localhost:3000/api/v1/messages?sessionId=mySession' \\
--H 'Authorization: Bearer your_token' \\
+            <TabsContent value="text" className="animate-in fade-in slide-in-from-bottom-4 duration-300">
+              <CodeBlock code={`curl -X POST 'http://localhost:3000/api/v1/messages?sessionId=maSession' \\
+-H 'Authorization: Bearer votre_token' \\
 -H 'Content-Type: application/json' \\
 -d '{
   "recipient_type": "individual",
   "to": "6281234567890",
   "type": "text",
-  "text": { "body": "Hello World" }
+  "text": { "body": "Bonjour le monde" }
 }'`} lang="bash" />
             </TabsContent>
             
-            <TabsContent value="image">
-              <CodeBlock code={`curl -X POST 'http://localhost:3000/api/v1/messages?sessionId=mySession' \\
--H 'Authorization: Bearer your_token' \\
+            <TabsContent value="image" className="animate-in fade-in slide-in-from-bottom-4 duration-300">
+              <CodeBlock code={`curl -X POST 'http://localhost:3000/api/v1/messages?sessionId=maSession' \\
+-H 'Authorization: Bearer votre_token' \\
 -H 'Content-Type: application/json' \\
 -d '{
   "recipient_type": "individual",
   "to": "6281234567890",
   "type": "image",
   "image": {
-    "link": "https://example.com/image.jpg",
-    "caption": "Check this out!"
+    "link": "https://exemple.com/image.jpg",
+    "caption": "Regardez ça !"
   }
 }'`} lang="bash" />
             </TabsContent>
 
-            <TabsContent value="audio">
-              <CodeBlock code={`curl -X POST 'http://localhost:3000/api/v1/messages?sessionId=mySession' \\
--H 'Authorization: Bearer your_token' \\
+            <TabsContent value="audio" className="animate-in fade-in slide-in-from-bottom-4 duration-300">
+              <CodeBlock code={`curl -X POST 'http://localhost:3000/api/v1/messages?sessionId=maSession' \\
+-H 'Authorization: Bearer votre_token' \\
 -H 'Content-Type: application/json' \\
 -d '{
   "recipient_type": "individual",
   "to": "6281234567890",
   "type": "audio",
   "audio": {
-    "link": "https://www.soundhelix.com/examples/mp3/SoundHelix-Song-1.mp3",
+    "link": "https://www.exemple.com/audio.mp3",
     "ptt": true
   }
 }'`} lang="bash" />
-              <p className="text-sm text-muted-foreground mt-2">
-                Use <code>&quot;ptt&quot;: true</code> for Push-to-Talk style voice messages.
-              </p>
             </TabsContent>
-
-            <TabsContent value="video">
-              <CodeBlock code={`curl -X POST 'http://localhost:3000/api/v1/messages?sessionId=mySession' \\
--H 'Authorization: Bearer your_token' \\
+            
+            <TabsContent value="video" className="animate-in fade-in slide-in-from-bottom-4 duration-300">
+              <CodeBlock code={`curl -X POST 'http://localhost:3000/api/v1/messages?sessionId=maSession' \\
+-H 'Authorization: Bearer votre_token' \\
 -H 'Content-Type: application/json' \\
 -d '{
   "recipient_type": "individual",
   "to": "6281234567890",
   "type": "video",
   "video": {
-    "link": "https://www.w3schools.com/html/mov_bbb.mp4",
-    "caption": "WhatsApp Video Message"
+    "link": "https://exemple.com/video.mp4",
+    "caption": "Ma vidéo"
   }
 }'`} lang="bash" />
             </TabsContent>
-
-            <TabsContent value="document">
-              <CodeBlock code={`curl -X POST 'http://localhost:3000/api/v1/messages?sessionId=mySession' \\
--H 'Authorization: Bearer your_token' \\
+            
+            <TabsContent value="document" className="animate-in fade-in slide-in-from-bottom-4 duration-300">
+              <CodeBlock code={`curl -X POST 'http://localhost:3000/api/v1/messages?sessionId=maSession' \\
+-H 'Authorization: Bearer votre_token' \\
 -H 'Content-Type: application/json' \\
 -d '{
   "recipient_type": "individual",
   "to": "6281234567890",
   "type": "document",
   "document": {
-    "link": "https://example.com/file.pdf",
-    "filename": "document.pdf",
-    "caption": "Please review this document"
+    "link": "https://exemple.com/doc.pdf",
+    "filename": "facture.pdf"
   }
 }'`} lang="bash" />
             </TabsContent>
@@ -290,64 +310,73 @@ export function DocsContent() {
       </section>
 
       {/* Webhooks */}
-      <section id="webhooks" className="scroll-mt-20">
-        <div className="flex items-center gap-2 mb-6">
-          <Share2 className="w-6 h-6 text-primary" />
-          <h2 className="text-3xl font-bold tracking-tight">Webhooks</h2>
+      <section id="webhooks" className="scroll-mt-24">
+        <div className="flex items-center gap-4 mb-10">
+          <div className="p-3 bg-primary/10 rounded-lg shadow-inner">
+            <Share2 className="w-8 h-8 text-primary" />
+          </div>
+          <h2 className="text-3xl font-black tracking-tight uppercase">Webhooks</h2>
         </div>
+
         <Endpoint method="POST" path="/webhook">
-          <h4 className="text-xl font-bold mb-2">Set Webhook URL</h4>
-          <p className="text-muted-foreground mb-4">
-            Configure where the server sends event notifications.
+          <h4 className="text-xl font-black uppercase tracking-tight mb-3">Définir l'URL du Webhook</h4>
+          <p className="text-muted-foreground text-[11px] font-bold uppercase tracking-widest opacity-70 mb-8 leading-relaxed">
+            Configurez l'endroit où le serveur envoie les notifications d'événements.
           </p>
           <CodeBlock code={`curl -X POST 'http://localhost:3000/api/v1/webhook' \\
--H 'Authorization: Bearer your_token' \\
+-H 'Authorization: Bearer votre_token' \\
 -H 'Content-Type: application/json' \\
 -d '{
-  "sessionId": "mySession",
-  "url": "https://your-webhook.com/handler"
+  "sessionId": "maSession",
+  "url": "https://votre-webhook.com/handler"
 }'`} />
         </Endpoint>
       </section>
 
       {/* Campaigns */}
-      <section id="campaigns" className="scroll-mt-20">
-        <div className="flex items-center gap-2 mb-6">
-          <Zap className="w-6 h-6 text-primary" />
-          <h2 className="text-3xl font-bold tracking-tight">Campaigns</h2>
+      <section id="campaigns" className="scroll-mt-24">
+        <div className="flex items-center gap-4 mb-10">
+          <div className="p-3 bg-primary/10 rounded-lg shadow-inner">
+            <Zap className="w-8 h-8 text-primary" />
+          </div>
+          <h2 className="text-3xl font-black tracking-tight uppercase">Campagnes</h2>
         </div>
+
         <Endpoint method="POST" path="/campaigns">
-          <h4 className="text-xl font-bold mb-2">Create Campaign</h4>
-          <p className="text-muted-foreground mb-4">
-            Create a bulk messaging campaign.
+          <h4 className="text-xl font-black uppercase tracking-tight mb-3">Créer une Campagne</h4>
+          <p className="text-muted-foreground text-[11px] font-bold uppercase tracking-widest opacity-70 mb-8 leading-relaxed">
+            Créez une campagne de messagerie en masse.
           </p>
           <CodeBlock code={`curl -X POST 'http://localhost:3000/api/v1/campaigns' \\
--H 'Authorization: Bearer your_token' \\
+-H 'Authorization: Bearer votre_token' \\
 -H 'Content-Type: application/json' \\
 -d '{
-  "name": "Spring Promotion",
-  "sessionId": "mySession",
+  "name": "Promotion de Printemps",
+  "sessionId": "maSession",
   "recipientListId": "list_123",
-  "message": "Check out our new spring collection!",
+  "message": "Découvrez notre nouvelle collection !",
   "scheduledAt": "2024-06-01T10:00:00Z"
 }'`} />
         </Endpoint>
       </section>
 
       {/* Media Management */}
-      <section id="media" className="scroll-mt-20">
-        <div className="flex items-center gap-2 mb-6">
-          <FileJson className="w-6 h-6 text-primary" />
-          <h2 className="text-3xl font-bold tracking-tight">Media Management</h2>
+      <section id="media" className="scroll-mt-24">
+        <div className="flex items-center gap-4 mb-10">
+          <div className="p-3 bg-primary/10 rounded-lg shadow-inner">
+            <FileJson className="w-8 h-8 text-primary" />
+          </div>
+          <h2 className="text-3xl font-black tracking-tight uppercase">Gestion des Médias</h2>
         </div>
+
         <Endpoint method="POST" path="/media/upload">
-          <h4 className="text-xl font-bold mb-2">Upload Media</h4>
-          <p className="text-muted-foreground mb-4">
-            Upload a file to get a media ID or link for use in messages.
+          <h4 className="text-xl font-black uppercase tracking-tight mb-3">Télécharger un Média</h4>
+          <p className="text-muted-foreground text-[11px] font-bold uppercase tracking-widest opacity-70 mb-8 leading-relaxed">
+            Téléchargez un fichier pour obtenir un identifiant ou un lien média à utiliser dans les messages.
           </p>
           <CodeBlock code={`curl -X POST 'http://localhost:3000/api/v1/media/upload' \\
--H 'Authorization: Bearer your_token' \\
--F 'file=@/path/to/your/file.jpg'`} lang="bash" />
+-H 'Authorization: Bearer votre_token' \\
+-F 'file=@/chemin/vers/votre/fichier.jpg'`} lang="bash" />
         </Endpoint>
       </section>
 

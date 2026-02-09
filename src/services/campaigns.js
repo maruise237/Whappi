@@ -4,6 +4,7 @@ const sanitizeHtml = require('sanitize-html');
 const { format } = require('date-fns');
 const { encrypt, decrypt } = require('../utils/crypto');
 const { isValidId } = require('../utils/validation');
+const { log } = require('../utils/logger');
 
 class CampaignManager {
     constructor(encryptionKey) {
@@ -36,41 +37,39 @@ class CampaignManager {
         try {
             return JSON.parse(decrypted);
         } catch (e) {
-            console.error('Failed to parse decrypted campaign data:', e);
+            log(`Échec de l'analyse des données de campagne déchiffrées: ${e.message}`, 'CAMPAIGN', { error: e.message }, 'ERROR');
             return null;
         }
     }
 
     // Save campaign to file
     saveCampaign(campaign) {
-        console.log(`[CampaignManager] Saving campaign: ${campaign.id}`);
-        if (!isValidId(campaign.id)) {
-            console.error(`[CampaignManager] Invalid campaign ID during save: ${campaign.id}`);
-            throw new Error('Invalid campaign ID');
-        }
         const filePath = path.join(this.campaignsDir, `${campaign.id}.json`);
-        console.log(`[CampaignManager] Writing to: ${filePath}`);
-
+        log(`Sauvegarde de la campagne: ${campaign.id}`, 'CAMPAIGN', { campaignId: campaign.id }, 'INFO');
+        
         try {
-            const encrypted = this.encrypt(campaign);
-            console.log(`[CampaignManager] Data encrypted for ${campaign.id}`);
-            fs.writeFileSync(filePath, encrypted, 'utf-8');
-            console.log(`[CampaignManager] File written successfully: ${campaign.id}`);
+            const data = JSON.stringify(campaign, null, 2);
+            log(`Écriture dans: ${filePath}`, 'CAMPAIGN', { filePath }, 'DEBUG');
+            
+            if (this.encryptionKey) {
+                const encrypted = encrypt(data, this.encryptionKey);
+                fs.writeFileSync(filePath, encrypted);
+                log(`Données chiffrées pour ${campaign.id}`, 'CAMPAIGN', { campaignId: campaign.id }, 'INFO');
+            } else {
+                fs.writeFileSync(filePath, data);
+            }
+            log(`Fichier écrit avec succès: ${campaign.id}`, 'CAMPAIGN', { campaignId: campaign.id }, 'INFO');
+            return true;
         } catch (error) {
-            console.error(`[CampaignManager] Error during encryption or file write for ${campaign.id}:`, error);
-            throw error;
-        }
-
-        // Set file permissions (read/write for owner only)
-        if (process.platform !== 'win32') {
-            fs.chmodSync(filePath, 0o600);
+            log(`Erreur lors de la sauvegarde de la campagne ${campaign.id}: ${error.message}`, 'CAMPAIGN', { error: error.message }, 'ERROR');
+            return false;
         }
     }
 
     // Load campaign from file
     loadCampaign(campaignId) {
         if (!require('../utils/validation').isValidId(campaignId)) {
-            console.error('Invalid campaign ID:', campaignId);
+            log(`ID de campagne invalide: ${campaignId}`, 'CAMPAIGN', { campaignId }, 'ERROR');
             return null;
         }
         try {
@@ -82,7 +81,7 @@ class CampaignManager {
             const encrypted = fs.readFileSync(filePath, 'utf-8');
             return this.decrypt(encrypted);
         } catch (error) {
-            console.error('Error loading campaign:', error);
+            log(`Erreur lors du chargement de la campagne: ${error.message}`, 'CAMPAIGN', { error: error.message }, 'ERROR');
             return null;
         }
     }
@@ -114,14 +113,14 @@ class CampaignManager {
             // Sort by creation date (newest first)
             return campaigns.sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
         } catch (error) {
-            console.error('Error getting campaigns:', error);
+            log(`Erreur lors de la récupération des campagnes: ${error.message}`, 'CAMPAIGN', { error: error.message }, 'ERROR');
             return [];
         }
     }
 
     // Create new campaign
     createCampaign(data) {
-        console.log('[CampaignManager] Creating new campaign:', data.name);
+        log(`Création d'une nouvelle campagne: ${data.name}`, 'CAMPAIGN', { name: data.name }, 'INFO');
         // Ensure all recipients have proper status initialization
         const recipients = (data.recipients || []).map(recipient => ({
             ...recipient,
@@ -166,9 +165,9 @@ class CampaignManager {
             }
         };
 
-        console.log(`[CampaignManager] Generated ID: ${campaign.id}`);
+        log(`ID généré: ${campaign.id}`, 'CAMPAIGN', { campaignId: campaign.id }, 'DEBUG');
         this.saveCampaign(campaign);
-        console.log(`[CampaignManager] Campaign ${campaign.id} created and saved`);
+        log(`Campagne ${campaign.id} créée et sauvegardée`, 'CAMPAIGN', { campaignId: campaign.id }, 'INFO');
         return campaign;
     }
 
@@ -241,7 +240,7 @@ class CampaignManager {
 
             return true;
         } catch (error) {
-            console.error('Error deleting campaign:', error);
+            log(`Erreur lors de la suppression de la campagne: ${error.message}`, 'CAMPAIGN', { error: error.message }, 'ERROR');
             return false;
         }
     }
@@ -291,13 +290,13 @@ class CampaignManager {
 
             if (semicolonCount > commaCount) {
                 delimiter = ';';
-                console.log('Detected semicolon delimiter in CSV');
+                log('Délimiteur point-virgule détecté dans le CSV', 'CAMPAIGN', null, 'DEBUG');
             }
 
             // Remove BOM if present
             if (csvContent.charCodeAt(0) === 0xFEFF) {
                 csvContent = csvContent.substr(1);
-                console.log('Removed BOM from CSV');
+                log('BOM supprimé du CSV', 'CAMPAIGN', null, 'DEBUG');
             }
 
             const records = parse(csvContent, {
@@ -309,10 +308,10 @@ class CampaignManager {
                 skip_records_with_empty_values: true
             });
 
-            console.log('Parsed CSV records:', records.length);
+            log(`Enregistrements CSV analysés: ${records.length}`, 'CAMPAIGN', { count: records.length }, 'DEBUG');
             if (records.length > 0) {
-                console.log('First record:', records[0]);
-                console.log('Headers found:', Object.keys(records[0]));
+                log('Premier enregistrement:', 'CAMPAIGN', { record: records[0] }, 'DEBUG');
+                log('En-têtes trouvés:', 'CAMPAIGN', { headers: Object.keys(records[0]) }, 'DEBUG');
             }
 
             const recipients = [];
@@ -381,7 +380,7 @@ class CampaignManager {
                 headers: records.length > 0 ? Object.keys(records[0]) : []
             };
         } catch (error) {
-            console.error('CSV parsing error details:', error);
+            log(`Erreur d'analyse CSV: ${error.message}`, 'CAMPAIGN', { error: error.message }, 'ERROR');
             return {
                 success: false,
                 recipients: [],
@@ -468,19 +467,14 @@ class CampaignManager {
     getPendingRecipients(campaignId, limit = 100) {
         const campaign = this.loadCampaign(campaignId);
         if (!campaign) {
-            console.log(`⚠️ Campaign not found: ${campaignId}`);
+            log(`Campagne non trouvée: ${campaignId}`, 'CAMPAIGN', { campaignId }, 'WARN');
             return [];
         }
 
-        console.log(`🔍 Getting pending recipients for campaign ${campaignId}:`, {
+        log(`Récupération des destinataires en attente pour la campagne ${campaignId}`, 'CAMPAIGN', {
             totalRecipients: campaign.recipients.length,
-            recipientDetails: campaign.recipients.map(r => ({
-                number: r.number,
-                status: r.status,
-                retryCount: r.retryCount || 0
-            })),
             maxRetries: campaign.settings.maxRetries
-        });
+        }, 'DEBUG');
 
         const pendingRecipients = campaign.recipients
             .filter(r =>
@@ -491,7 +485,7 @@ class CampaignManager {
             )
             .slice(0, limit);
 
-        console.log(`📊 Found ${pendingRecipients.length} pending recipients`);
+        log(`${pendingRecipients.length} destinataires en attente trouvés`, 'CAMPAIGN', { count: pendingRecipients.length }, 'DEBUG');
 
         return pendingRecipients;
     }

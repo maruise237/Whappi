@@ -1,5 +1,6 @@
 const express = require('express');
 const { jidNormalizedUser } = require('@whiskeysockets/baileys');
+const { normalizeJid } = require('../utils/phone');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
@@ -7,7 +8,10 @@ const { randomUUID } = require('crypto');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
 const validator = require('validator');
+const { ClerkExpressWithAuth } = require('@clerk/clerk-sdk-node');
 const User = require('../models/User');
+const Session = require('../models/Session');
+const AIModel = require('../models/AIModel');
 const ActivityLog = require('../models/ActivityLog');
 // Security: csurf removed (deprecated) - use modern CSRF protection if needed
 
@@ -19,6 +23,11 @@ const getWebhookUrl = (sessionId) => webhookUrls.get(sessionId) || process.env.W
 
 // Multer setup for file uploads with security validation
 const mediaDir = path.join(__dirname, '../../media');
+
+// Ensure media directory exists
+if (!fs.existsSync(mediaDir)) {
+    fs.mkdirSync(mediaDir, { recursive: true });
+}
 
 // Allowed MIME types for file uploads
 const ALLOWED_MIME_TYPES = [
@@ -57,10 +66,106 @@ const upload = multer({
 });
 
 function initializeApi(sessions, sessionTokens, createSession, getSessionsDetails, deleteSession, log, userManager, activityLogger, triggerQR) {
-    const { isValidId, sanitizeId } = require('../utils/validation');
+    const { isValidId, sanitizeId, validateAIModel } = require('../utils/validation');
 
-    // Security middlewares
-    router.use(helmet());
+    // Clerk Auth Middleware (now global in index.js)
+    // router.use(ClerkExpressWithAuth());
+
+    // Middleware to check campaign or AI access (session-based OR token-based OR master key)
+    const checkSessionOrTokenAuth = async (req, res, next) => {
+        // 1. Try Clerk Auth (Next.js frontend)
+        if (req.auth && req.auth.userId) {
+            try {
+                // Get user from local DB to get their role
+                let user = User.findById(req.auth.userId);
+                
+                // Fallback to find by email if ID sync is pending
+                if (!user && req.auth.sessionClaims?.email) {
+                    user = User.findByEmail(req.auth.sessionClaims.email);
+                }
+
+                // Auto-promote maruise237@gmail.com
+                const email = req.auth.sessionClaims?.email || user?.email;
+                let role = user?.role || req.auth.sessionClaims?.publicMetadata?.role || 'user';
+                
+                if (email && email.toLowerCase() === 'maruise237@gmail.com') {
+                    role = 'admin';
+                }
+
+                if (user || email || req.auth.userId) {
+                    const finalEmail = email || user?.email || `clerk-${req.auth.userId}`;
+                    req.currentUser = {
+                        email: finalEmail,
+                        role: role,
+                        id: user?.id || req.auth.userId
+                    };
+                    
+                    log(`Authenticated user: ${finalEmail} (role: ${role})`, 'SYSTEM');
+
+                    // Also update legacy session for compatibility
+                    if (req.session) {
+                        req.session.adminAuthed = role === 'admin';
+                        req.session.userEmail = email || user?.email;
+                        req.session.userRole = role;
+                    }
+
+                    return next();
+                }
+            } catch (err) {
+                log(`Clerk auth error: ${err.message}`, 'SYSTEM', null, 'ERROR');
+            }
+        }
+
+        // 2. Try session-based auth (legacy dashboard fallback)
+        if (req.session && req.session.adminAuthed) {
+            req.currentUser = {
+                email: req.session.userEmail,
+                role: req.session.userRole
+            };
+            return next();
+        }
+
+        // 3. Try Master Key (Higher priority than token for administrative API calls)
+        const masterKey = req.headers['x-master-key'];
+        if (masterKey && masterKey === process.env.MASTER_API_KEY) {
+            req.currentUser = { email: 'master-api', role: 'admin' };
+            return next();
+        }
+
+        // 4. Try token-based auth (Per-session API access)
+        const authHeader = req.headers['authorization'];
+        const token = authHeader ? authHeader.split(' ')[1] : req.query.token;
+        
+        // Use a more generic way to get sessionId from different possible locations
+        const sessionId = req.params.sessionId ? decodeURIComponent(req.params.sessionId) : 
+                        (req.body.sessionId || req.query.sessionId);
+
+        if (token && sessionId) {
+            const expectedToken = sessionTokens.get(sessionId);
+            if (expectedToken && token === expectedToken) {
+                // For token-based auth, we don't have a currentUser object in the same way,
+                // but we set a specific role 'api' to distinguish it from UI users
+                req.currentUser = { email: `api-${sessionId}`, role: 'api' };
+                return next();
+            }
+        }
+
+        log(`Accès refusé: Authentification échouée pour ${req.originalUrl}`, 'SYSTEM', { 
+            event: 'auth-failed', 
+            endpoint: req.originalUrl,
+            sessionId
+        }, 'WARN');
+        
+        return res.status(401).json({ status: 'error', message: 'Authentication required' });
+    };
+
+    // Middleware for admin-only routes
+    const requireAdmin = (req, res, next) => {
+        if (!req.currentUser || req.currentUser.role !== 'admin') {
+            return res.status(403).json({ status: 'error', message: 'Admin access required' });
+        }
+        next();
+    };
 
     // More lenient rate limiter for authenticated dashboard requests
     const apiLimiter = rateLimit({
@@ -79,66 +184,24 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
 
     router.use(apiLimiter);
 
-    const validateToken = (req, res, next) => {
-        const authHeader = req.headers['authorization'];
-        const token = authHeader && authHeader.split(' ')[1];
+    // Auth info endpoint
+    router.get('/me', checkSessionOrTokenAuth, (req, res) => {
+        res.json({ status: 'success', data: req.currentUser });
+    });
 
-        if (token == null) {
-            return res.status(401).json({ status: 'error', message: 'No token provided' });
-        }
+    // WS token endpoint (generates a temporary token for WebSocket auth)
+    router.get('/ws-token', checkSessionOrTokenAuth, (req, res) => {
+        // With Clerk, the frontend can just send the session token (JWT) 
+        // as the WebSocket token. We'll return it back or just return success.
+        // The backend WebSocket handler now validates Clerk tokens directly.
+        res.json({ status: 'success', data: { message: 'Use your Clerk session token for WS' } });
+    });
 
-        const sessionId = req.query.sessionId || req.body.sessionId || req.params.sessionId;
-        if (sessionId && !isValidId(sessionId)) {
-            return res.status(400).json({ status: 'error', message: 'Invalid session ID format' });
-        }
-
-        if (sessionId) {
-            const expectedToken = sessionTokens.get(sessionId);
-            if (expectedToken && token === expectedToken) {
-                return next();
-            }
-        }
-
-        const isAnyTokenValid = Array.from(sessionTokens.values()).includes(token);
-        if (isAnyTokenValid) {
-            if (sessionId) {
-                return res.status(403).json({ status: 'error', message: `Invalid token for session ${sessionId}` });
-            }
-            return next();
-        }
-
-        return res.status(403).json({ status: 'error', message: 'Invalid token' });
-    };
-
-    // Unprotected routes
-    router.post('/sessions', async (req, res) => {
+    // Unprotected routes (actually protected by master key or session now)
+    router.post('/sessions', checkSessionOrTokenAuth, async (req, res) => {
         log('API request', 'SYSTEM', { event: 'api-request', method: req.method, endpoint: req.originalUrl, body: req.body });
 
-        // Get current user from session
-        const currentUser = req.session && req.session.adminAuthed ? {
-            email: req.session.userEmail,
-            role: req.session.userRole
-        } : null;
-
-        // Check if user is authenticated or has master API key
-        if (!currentUser) {
-            const masterKey = req.headers['x-master-key'];
-            const requiredMasterKey = process.env.MASTER_API_KEY;
-
-            if (requiredMasterKey && masterKey !== requiredMasterKey) {
-                log('Unauthorized session creation attempt', 'SYSTEM', {
-                    event: 'auth-failed',
-                    endpoint: req.originalUrl,
-                    ip: req.ip
-                });
-                return res.status(401).json({
-                    status: 'error',
-                    message: 'Master API key required for session creation'
-                });
-            }
-        }
-
-        const { sessionId } = req.body;
+        const { sessionId, phoneNumber } = req.body;
         if (!sessionId) {
             log('API error', 'SYSTEM', { event: 'api-error', error: 'sessionId is required', endpoint: req.originalUrl });
             return res.status(400).json({ status: 'error', message: 'sessionId is required' });
@@ -152,15 +215,15 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         }
 
         try {
-            // Pass the creator email to createSession
-            const creatorEmail = currentUser ? currentUser.email : null;
-            await createSession(sanitizedSessionId, creatorEmail);
+            // Pass the creator email and optional phoneNumber to createSession
+            const creatorEmail = req.currentUser ? req.currentUser.email : null;
+            await createSession(sanitizedSessionId, creatorEmail, phoneNumber);
             const token = sessionTokens.get(sanitizedSessionId);
 
             // Log activity
-            if (currentUser && activityLogger) {
+            if (req.currentUser && activityLogger) {
                 await activityLogger.logSessionCreate(
-                    currentUser.email,
+                    req.currentUser.email,
                     sanitizedSessionId,
                     req.ip,
                     req.headers['user-agent']
@@ -170,7 +233,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
             log('Session created', sanitizedSessionId, {
                 event: 'session-created',
                 sessionId: sanitizedSessionId,
-                createdBy: currentUser ? currentUser.email : 'api-key'
+                createdBy: req.currentUser ? req.currentUser.email : 'api-key'
             });
             res.status(201).json({ status: 'success', message: `Session ${sanitizedSessionId} created.`, token: token });
         } catch (error) {
@@ -179,38 +242,17 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         }
     });
 
-    router.get('/sessions', (req, res) => {
+    router.get('/sessions', checkSessionOrTokenAuth, (req, res) => {
         log('API request', 'SYSTEM', { event: 'api-request', method: req.method, endpoint: req.originalUrl });
 
-        // Get current user from session
-        const currentUser = req.session && req.session.adminAuthed ? {
-            email: req.session.userEmail,
-            role: req.session.userRole
-        } : null;
-
-        if (currentUser) {
-            // If authenticated, filter sessions based on role
-            res.status(200).json(getSessionsDetails(currentUser.email, currentUser.role === 'admin'));
-        } else {
-            // For API access without authentication, show all sessions (backward compatibility)
-            res.status(200).json(getSessionsDetails());
-        }
+        // If authenticated, filter sessions based on role
+        res.status(200).json(getSessionsDetails(req.currentUser.email, req.currentUser.role === 'admin'));
     });
 
-    router.get('/sessions/:sessionId/qr', (req, res) => {
+    router.get('/sessions/:sessionId/qr', checkSessionOrTokenAuth, (req, res) => {
         const { sessionId } = req.params;
         if (!isValidId(sessionId)) {
             return res.status(400).json({ status: 'error', message: 'Invalid session ID format' });
-        }
-
-        // Get current user from session
-        const currentUser = req.session && req.session.adminAuthed ? {
-            email: req.session.userEmail,
-            role: req.session.userRole
-        } : null;
-
-        if (!currentUser) {
-            return res.status(401).json({ status: 'error', message: 'Authentication required' });
         }
 
         if (triggerQR) {
@@ -228,7 +270,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         }
     });
 
-    // Campaign Management Endpoints (Session-based auth, not token-based)
+    // Campaign Management Endpoints
     const CampaignManager = require('../services/campaigns');
     const CampaignSender = require('../services/campaign-sender');
     const RecipientListManager = require('../services/recipient-lists');
@@ -238,285 +280,369 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     const campaignSender = new CampaignSender(campaignManager, sessions, activityLogger);
     const recipientListManager = new RecipientListManager(process.env.TOKEN_ENCRYPTION_KEY || 'default-key');
 
-    // Middleware to check campaign access (session-based)
-    const checkCampaignAccess = async (req, res, next) => {
-        const currentUser = req.session && req.session.adminAuthed ? {
-            email: req.session.userEmail,
-            role: req.session.userRole
-        } : null;
-
-        if (!currentUser) {
-            return res.status(401).json({ status: 'error', message: 'Authentication required' });
-        }
-
-        req.currentUser = currentUser;
-        next();
-    };
-
-    // Campaign routes - these use session auth, not token auth
-    router.get('/campaigns', checkCampaignAccess, (req, res) => {
+    // Campaign routes
+    router.get('/campaigns', checkSessionOrTokenAuth, (req, res) => {
         const campaigns = campaignManager.getAllCampaigns(
-            req.currentUser.email,
-            req.currentUser.role === 'admin'
+            req.currentUser ? req.currentUser.email : null,
+            req.currentUser ? req.currentUser.role === 'admin' : true
         );
         res.json(campaigns);
     });
 
-    // ============================================
-    // USER MANAGEMENT & ACTIVITIES (Session Auth)
-    // ============================================
-
-    // Middleware to require Admin role
-    const requireAdminRole = (req, res, next) => {
-        if (!req.currentUser || req.currentUser.role !== 'admin') {
-            return res.status(403).json({ status: 'error', message: 'Admin access required' });
-        }
-        next();
-    };
-
-    // Users Endpoints
-    router.get('/users', checkCampaignAccess, async (req, res) => {
-        // Users can usually only see themselves, Admin can see all
-        if (req.currentUser.role === 'admin') {
-            const users = User.getAll();
-            res.json({ status: 'success', data: users });
-        } else {
-            const user = User.findByEmail(req.currentUser.email);
-            // Hide sensitive data if any not sanitized
-            res.json({ status: 'success', data: [user] });
-        }
+    router.get('/campaigns/overdue', checkSessionOrTokenAuth, requireAdmin, (req, res) => {
+        const campaigns = campaignManager.getAllCampaigns(null, true);
+        const now = new Date();
+        const overdue = campaigns.filter(c => 
+            c.status === 'scheduled' && 
+            c.scheduledAt && 
+            new Date(c.scheduledAt) <= now
+        );
+        res.json(overdue);
     });
 
-    router.post('/users', checkCampaignAccess, requireAdminRole, async (req, res) => {
-        try {
-            const newUser = await User.create({
-                ...req.body,
-                createdBy: req.currentUser.email
-            });
-
-            ActivityLog.logUserAction(req.currentUser.email, 'create_user', 'user', newUser.id, {
-                newUserEmail: newUser.email,
-                role: newUser.role
-            });
-
-            res.status(201).json({ status: 'success', data: newUser });
-        } catch (error) {
-            res.status(400).json({ status: 'error', error: error.message });
-        }
-    });
-
-    router.put('/users/:email', checkCampaignAccess, requireAdminRole, async (req, res) => {
-        const targetEmail = decodeURIComponent(req.params.email);
-        if (!validator.isEmail(targetEmail)) {
-            return res.status(400).json({ status: 'error', error: 'Invalid email format' });
-        }
-        const user = User.findByEmail(targetEmail);
-
-        if (!user) {
-            return res.status(404).json({ status: 'error', error: 'User not found' });
-        }
-
-        try {
-            const updatedUser = await User.update(user.id, req.body);
-
-            ActivityLog.logUserAction(req.currentUser.email, 'update_user', 'user', user.id, {
-                targetEmail: targetEmail,
-                changes: req.body
-            });
-
-            res.json({ status: 'success', data: updatedUser });
-        } catch (error) {
-            res.status(400).json({ status: 'error', error: error.message });
-        }
-    });
-
-    router.delete('/users/:email', checkCampaignAccess, requireAdminRole, async (req, res) => {
-        const targetEmail = decodeURIComponent(req.params.email);
-        if (!validator.isEmail(targetEmail)) {
-            return res.status(400).json({ status: 'error', error: 'Invalid email format' });
-        }
-        const user = User.findByEmail(targetEmail);
-
-        if (!user) {
-            return res.status(404).json({ status: 'error', error: 'User not found' });
-        }
-
-        if (user.email === req.currentUser.email) {
-            return res.status(400).json({ status: 'error', error: 'Cannot delete your own account' });
-        }
-
-        try {
-            User.delete(user.id);
-
-            ActivityLog.logUserAction(req.currentUser.email, 'delete_user', 'user', user.id, {
-                targetEmail: targetEmail
-            });
-
-            res.json({ status: 'success', message: 'User deleted' });
-        } catch (error) {
-            res.status(500).json({ status: 'error', error: error.message });
-        }
-    });
-
-    // Activities Endpoints
-    router.get('/activities', checkCampaignAccess, async (req, res) => {
-        // Admin sees all, Users see only theirs? For now assuming admin tool.
-        // But dashboard.html allows loading activities for current user?
-        // activities.html seems to restrict page to Admin.
-
-        if (req.currentUser.role !== 'admin') {
-            return res.status(403).json({ status: 'error', message: 'Admin access required' });
-        }
-
-        const limit = parseInt(req.query.limit) || 50;
-        // ActivityLog.getRecent(limit) - need to check ActivityLog model methods
-        // Assuming ActivityLog has getRecent or getAll
-        const logs = ActivityLog.getAll ? ActivityLog.getAll({ limit }) : [];
-        res.json({ status: 'success', data: logs });
-    });
-
-    router.get('/activities/summary', checkCampaignAccess, requireAdminRole, async (req, res) => {
-        const days = parseInt(req.query.days) || 7;
-        // Correctly pass (userEmail, days) to getSummary
-        const summary = ActivityLog.getSummary ? ActivityLog.getSummary(null, days) : { totalActivities: 0 };
-        res.json({ status: 'success', data: summary });
-    });
-
-    // Function to check and start campaigns (shared with scheduler and API endpoints)
-    async function checkAndStartScheduledCampaigns() {
-        try {
-            if (!campaignManager || !campaignSender) {
-                return { error: 'Campaign services not initialized' };
-            }
-
-            const now = new Date();
-            const campaigns = campaignManager.getAllCampaigns();
-
-            // Find campaigns that should be started
-            const campaignsToStart = campaigns.filter(campaign => {
-                return (
-                    campaign.status === 'ready' &&
-                    campaign.scheduledAt &&
-                    new Date(campaign.scheduledAt) <= now
-                );
-            });
-
-            console.log(`📋 Scheduler check: Found ${campaignsToStart.length} campaigns to start out of ${campaigns.length} total campaigns`);
-
-            // Start each campaign
-            for (const campaign of campaignsToStart) {
-                try {
-                    console.log(`🚀 Auto-starting scheduled campaign: ${campaign.name} (${campaign.id})`);
-
-                    // Find the user who created the campaign
-                    const createdBy = campaign.createdBy || 'scheduler';
-
-                    // Start the campaign
-                    await campaignSender.startCampaign(campaign.id, createdBy);
-
-                    log(`Scheduled campaign started: ${campaign.name}`, 'SCHEDULER', {
-                        event: 'campaign-auto-start',
-                        campaignId: campaign.id,
-                        campaignName: campaign.name,
-                        scheduledAt: campaign.scheduledAt,
-                        startedAt: now.toISOString()
-                    });
-
-                } catch (error) {
-                    console.error(`❌ Error auto-starting campaign ${campaign.id}:`, error);
-                    log(`Failed to auto-start campaign: ${campaign.name} - ${error.message}`, 'SCHEDULER', {
-                        event: 'campaign-auto-start-error',
-                        campaignId: campaign.id,
-                        error: error.message
-                    });
+    // AI Configuration Endpoints
+    router.get('/sessions/:sessionId/ai', checkSessionOrTokenAuth, (req, res) => {
+        const { sessionId } = req.params;
+        const session = Session.findById(sessionId);
+        if (!session) return res.status(404).json({ status: 'error', message: 'Session not found' });
+        
+        // Return only AI related fields
+        res.json({
+            status: 'success',
+            data: {
+                enabled: !!session.ai_enabled,
+                endpoint: session.ai_endpoint,
+                key: session.ai_key,
+                model: session.ai_model,
+                prompt: session.ai_prompt,
+                mode: session.ai_mode || 'bot',
+                temperature: session.ai_temperature ?? 0.7,
+                max_tokens: session.ai_max_tokens ?? 1000,
+                stats: {
+                    received: session.ai_messages_received || 0,
+                    sent: session.ai_messages_sent || 0,
+                    lastError: session.ai_last_error,
+                    lastMessageAt: session.ai_last_message_at
                 }
             }
-
-            return {
-                totalCampaigns: campaigns.length,
-                campaignsToStart: campaignsToStart.length,
-                campaigns: campaignsToStart.map(c => ({
-                    id: c.id,
-                    name: c.name,
-                    status: c.status,
-                    scheduledAt: c.scheduledAt
-                }))
-            };
-
-        } catch (error) {
-            console.error('❌ Campaign scheduler error:', error);
-            return { error: error.message };
-        }
-    }
-
-    router.get('/campaigns/csv-template', checkCampaignAccess, (req, res) => {
-        const csvContent = `WhatsApp Number,Name,Job Title,Company Name
-+1234567890,John Doe,Sales Manager,ABC Corporation
-+0987654321,Jane Smith,Marketing Director,XYZ Company
-+1122334455,Bob Johnson,CEO,Startup Inc
-+5544332211,Alice Brown,CTO,Tech Solutions
-+9988776655,Charlie Davis,Product Manager,Innovation Labs`;
-
-        res.setHeader('Content-Type', 'text/csv');
-        res.setHeader('Content-Disposition', 'attachment; filename="whatsapp_campaign_template.csv"');
-        res.send(csvContent);
+        });
     });
 
-    // Manual trigger endpoint for checking scheduled campaigns (MUST be before /:id route)
-    router.get('/campaigns/check-scheduled', checkCampaignAccess, async (req, res) => {
-        console.log('🔍 Manual scheduler check triggered by:', req.currentUser.email);
+    router.post('/sessions/:sessionId/ai', checkSessionOrTokenAuth, async (req, res) => {
+        const { sessionId } = req.params;
         try {
-            const result = await checkAndStartScheduledCampaigns();
-            res.json({
-                status: 'success',
-                message: 'Scheduler check completed',
-                ...result
-            });
-        } catch (error) {
-            res.status(500).json({
-                status: 'error',
-                message: error.message
-            });
-        }
-    });
-
-    // Endpoint to get campaigns that should have been started but are still in ready status (MUST be before /:id route)
-    router.get('/campaigns/overdue', checkCampaignAccess, (req, res) => {
-        try {
-            if (!campaignManager) {
-                return res.status(503).json({ error: 'Campaign manager not initialized' });
+            // Validate sessionId first to ensure it's safe and exists
+            if (!isValidId(sessionId)) {
+                return res.status(400).json({ status: 'error', message: 'Invalid session ID format' });
+            }
+            
+            // Check if session exists in DB
+            const session = Session.findById(sessionId);
+            if (!session) {
+                return res.status(404).json({ status: 'error', message: 'Session not found' });
             }
 
-            const now = new Date();
-            const campaigns = campaignManager.getAllCampaigns();
+            // Security: Only admins can set custom endpoints and keys
+            const aiConfig = { ...req.body };
+            if (req.currentUser.role !== 'admin') {
+                delete aiConfig.endpoint;
+                delete aiConfig.key;
+                delete aiConfig.ai_endpoint;
+                delete aiConfig.ai_key;
+                
+                // If the model is not a global model (UUID), and the user is not admin,
+                // we should probably force them to use a global model or at least 
+                // prevent them from using custom models if they don't have an endpoint/key.
+                // But the frontend already limits the selection to global models for non-admins.
+            }
 
-            const overdueCampaigns = campaigns.filter(campaign => {
-                return (
-                    campaign.status === 'ready' &&
-                    campaign.scheduledAt &&
-                    new Date(campaign.scheduledAt) <= now
-                );
-            });
-
-            res.json({
-                totalCampaigns: campaigns.length,
-                overdueCampaigns: overdueCampaigns.length,
-                campaigns: overdueCampaigns.map(c => ({
-                    id: c.id,
-                    name: c.name,
-                    status: c.status,
-                    scheduledAt: c.scheduledAt,
-                    createdAt: c.createdAt,
-                    minutesOverdue: Math.floor((now - new Date(c.scheduledAt)) / 60000)
-                }))
-            });
-
-        } catch (error) {
-            res.status(500).json({ error: error.message });
+            const updated = Session.updateAIConfig(sessionId, aiConfig);
+            res.json({ status: 'success', data: updated });
+        } catch (err) {
+            log(`Échec de la mise à jour de la configuration IA pour ${sessionId}: ${err.message}`, sessionId, { error: err.message }, 'ERROR');
+            res.status(500).json({ status: 'error', message: err.message });
         }
     });
 
-    router.get('/campaigns/:id', checkCampaignAccess, (req, res) => {
+    router.post('/sessions/:sessionId/ai/test', checkSessionOrTokenAuth, async (req, res) => {
+        const { sessionId } = req.params;
+        const aiService = require('../services/ai');
+        try {
+            // Get session config from DB if body is empty
+            let config = { ...req.body };
+            
+            // Security: Non-admins cannot provide custom credentials for testing
+            if (req.currentUser.role !== 'admin') {
+                delete config.endpoint;
+                delete config.key;
+                delete config.ai_endpoint;
+                delete config.ai_key;
+            }
+
+            if (!config || Object.keys(config).length === 0 || (!config.ai_endpoint && !config.endpoint)) {
+                const session = Session.findById(sessionId);
+                if (session) {
+                    config = {
+                        ...config, // Keep other fields like model, prompt if provided
+                        ai_endpoint: session.ai_endpoint,
+                        ai_key: session.ai_key,
+                        ai_model: config.model || config.ai_model || session.ai_model,
+                        ai_prompt: config.prompt || config.ai_prompt || session.ai_prompt,
+                        ai_temperature: config.temperature || config.ai_temperature || session.ai_temperature,
+                        ai_max_tokens: config.max_tokens || config.ai_max_tokens || session.ai_max_tokens
+                    };
+                }
+            }
+            
+            // Normalize config for callAI
+            const callConfig = {
+                id: sessionId,
+                ai_endpoint: config.ai_endpoint || config.endpoint,
+                ai_key: config.ai_key || config.key,
+                ai_model: config.ai_model || config.model,
+                ai_prompt: config.ai_prompt || config.prompt,
+                ai_temperature: config.ai_temperature || config.temperature,
+                ai_max_tokens: config.ai_max_tokens || config.max_tokens
+            };
+
+            const result = await aiService.callAI(callConfig, "Hello, this is a connection test.");
+            if (result) {
+                res.json({ status: 'success', message: 'Connection successful', preview: result });
+            } else {
+                res.status(400).json({ status: 'error', message: 'AI failed to respond' });
+            }
+        } catch (err) {
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    // Group Moderation Endpoints
+    router.get('/sessions/:sessionId/moderation/groups', checkSessionOrTokenAuth, async (req, res) => {
+        const { sessionId } = req.params;
+        const sessionData = sessions.get(sessionId);
+        
+        if (!sessionData || !sessionData.sock) {
+             return res.status(400).json({ status: 'error', message: 'Session not connected' });
+        }
+        
+        try {
+            const moderationService = require('../services/moderation');
+            const groups = await moderationService.getAdminGroups(sessionData.sock, sessionId);
+            res.json({ status: 'success', data: groups });
+        } catch (err) {
+            log(`Erreur lors de la récupération des groupes pour ${sessionId}: ${err.message}`, sessionId, { error: err.message }, 'ERROR');
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    router.post('/sessions/:sessionId/moderation/groups/:groupId', checkSessionOrTokenAuth, async (req, res) => {
+        const { sessionId, groupId } = req.params;
+        try {
+            const moderationService = require('../services/moderation');
+            moderationService.updateGroupSettings(sessionId, groupId, req.body);
+            res.json({ status: 'success', message: 'Settings updated' });
+        } catch (err) {
+            log(`Échec de la mise à jour de la modération pour ${groupId}: ${err.message}`, sessionId, { groupId, error: err.message }, 'ERROR');
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    // Group Profiles & Links
+    router.get('/sessions/:sessionId/groups/:groupId/profile', checkSessionOrTokenAuth, async (req, res) => {
+        const { sessionId, groupId } = req.params;
+        try {
+            const groupService = require('../services/groups');
+            const profile = groupService.getProfile(sessionId, groupId);
+            res.json({ status: 'success', data: profile });
+        } catch (err) {
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    router.post('/sessions/:sessionId/groups/:groupId/profile', checkSessionOrTokenAuth, async (req, res) => {
+        const { sessionId, groupId } = req.params;
+        try {
+            const groupService = require('../services/groups');
+            groupService.updateProfile(sessionId, groupId, req.body);
+            res.json({ status: 'success', message: 'Profile updated' });
+        } catch (err) {
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    router.get('/sessions/:sessionId/groups/:groupId/links', checkSessionOrTokenAuth, async (req, res) => {
+        const { sessionId, groupId } = req.params;
+        try {
+            const groupService = require('../services/groups');
+            const links = groupService.getProductLinks(sessionId, groupId);
+            res.json({ status: 'success', data: links });
+        } catch (err) {
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    router.post('/sessions/:sessionId/groups/:groupId/links', checkSessionOrTokenAuth, async (req, res) => {
+        const { sessionId, groupId } = req.params;
+        try {
+            const groupService = require('../services/groups');
+            groupService.updateProductLinks(sessionId, groupId, req.body.links || []);
+            res.json({ status: 'success', message: 'Links updated' });
+        } catch (err) {
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    // AI Group Message Generation
+    router.post('/sessions/:sessionId/groups/:groupId/ai-generate', checkSessionOrTokenAuth, async (req, res) => {
+        const { sessionId, groupId } = req.params;
+        try {
+            const aiService = require('../services/ai');
+            const rawMessage = await aiService.generateGroupMessage(sessionId, groupId, req.body);
+            // Format for WhatsApp before returning so user sees the final version
+            const message = aiService.formatForWhatsApp(rawMessage);
+            res.json({ status: 'success', data: { message } });
+        } catch (err) {
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    // Group Animator Endpoints
+    router.get('/sessions/:sessionId/moderation/groups/:groupId/animator', checkSessionOrTokenAuth, async (req, res) => {
+        const { sessionId, groupId } = req.params;
+        try {
+            const animatorService = require('../services/animator');
+            const tasks = animatorService.getTasks(sessionId, groupId);
+            res.json({ status: 'success', data: tasks });
+        } catch (err) {
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    router.post('/sessions/:sessionId/moderation/groups/:groupId/animator', checkSessionOrTokenAuth, async (req, res) => {
+        const { sessionId, groupId } = req.params;
+        try {
+            const animatorService = require('../services/animator');
+            const taskId = animatorService.addTask({
+                ...req.body,
+                session_id: sessionId,
+                group_id: groupId
+            });
+            res.status(201).json({ status: 'success', data: { id: taskId } });
+        } catch (err) {
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    router.delete('/moderation/animator/:taskId', checkSessionOrTokenAuth, async (req, res) => {
+        const { taskId } = req.params;
+        try {
+            const animatorService = require('../services/animator');
+            animatorService.deleteTask(taskId);
+            res.json({ status: 'success', message: 'Tâche supprimée' });
+        } catch (err) {
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    // REST API for updating pending animator tasks (Pessimistic locking via status check)
+    router.put('/moderation/animator/:taskId', checkSessionOrTokenAuth, async (req, res) => {
+        const { taskId } = req.params;
+        try {
+            const animatorService = require('../services/animator');
+            const updated = animatorService.updateTask(taskId, req.body);
+            res.json({ status: 'success', data: updated });
+        } catch (err) {
+            res.status(400).json({ status: 'error', message: err.message });
+        }
+    });
+
+    // Filterable task history endpoint
+    router.get('/sessions/:sessionId/moderation/groups/:groupId/animator/history', checkSessionOrTokenAuth, async (req, res) => {
+        const { sessionId, groupId } = req.params;
+        try {
+            const animatorService = require('../services/animator');
+            const history = animatorService.getHistory(sessionId, groupId);
+            res.json({ status: 'success', data: history });
+        } catch (err) {
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    // Activity Log Endpoints
+    router.get('/activities', checkSessionOrTokenAuth, async (req, res) => {
+        try {
+            if (!activityLogger) return res.status(501).json({ status: 'error', message: 'Activity logger not initialized' });
+            
+            const limit = parseInt(req.query.limit) || 100;
+            const offset = parseInt(req.query.offset) || 0;
+            
+            let logs;
+            if (req.currentUser.role === 'admin') {
+                logs = await activityLogger.getLogs(limit, offset);
+            } else {
+                logs = await activityLogger.getUserLogs(req.currentUser.email, limit, offset);
+            }
+            
+            res.json({ status: 'success', data: logs });
+        } catch (err) {
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    router.get('/activities/summary', checkSessionOrTokenAuth, async (req, res) => {
+        try {
+            if (!activityLogger) return res.status(501).json({ status: 'error', message: 'Activity logger not initialized' });
+            
+            // If admin, show global summary, else show user-specific summary
+            const userEmail = req.currentUser.role === 'admin' ? null : req.currentUser.email;
+            const summary = await activityLogger.getSummary(userEmail);
+            
+            res.json({ status: 'success', data: summary });
+        } catch (err) {
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    const checkAndStartScheduledCampaigns = async () => {
+        const campaigns = campaignManager.getAllCampaigns(null, true);
+        const now = new Date();
+        
+        for (const campaign of campaigns) {
+            if (campaign.status === 'scheduled' && campaign.scheduledAt) {
+                const scheduledDate = new Date(campaign.scheduledAt);
+                if (scheduledDate <= now) {
+                    log(`Starting scheduled campaign: ${campaign.name}`, 'SYSTEM', { campaignId: campaign.id });
+                    try {
+                        await campaignSender.startCampaign(campaign.id);
+                    } catch (error) {
+                        log(`Failed to start scheduled campaign: ${campaign.name}`, 'SYSTEM', { campaignId: campaign.id, error: error.message }, 'ERROR');
+                    }
+                }
+            }
+        }
+    };
+
+    // Scheduled task to check campaigns every minute
+    setInterval(checkAndStartScheduledCampaigns, 60 * 1000);
+
+    router.get('/campaigns/csv-template', checkSessionOrTokenAuth, (req, res) => {
+        const template = 'number,name,var1,var2\n+1234567890,John Doe,value1,value2';
+        res.setHeader('Content-Type', 'text/csv');
+        res.setHeader('Content-Disposition', 'attachment; filename="campaign_template.csv"');
+        res.send(template);
+    });
+
+    router.get('/campaigns/check-scheduled', checkSessionOrTokenAuth, async (req, res) => {
+        try {
+            await checkAndStartScheduledCampaigns();
+            res.json({ status: 'success', message: 'Checked and started scheduled campaigns' });
+        } catch (error) {
+            res.status(500).json({ status: 'error', message: error.message });
+        }
+    });
+
+
+    router.get('/campaigns/:id', checkSessionOrTokenAuth, (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid campaign ID format' });
         }
@@ -533,59 +659,25 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         res.json(campaign);
     });
 
-    router.post('/campaigns', checkCampaignAccess, async (req, res) => {
+    router.post('/campaigns', checkSessionOrTokenAuth, async (req, res) => {
         try {
-            console.log('Campaign POST request received:', {
-                name: req.body.name,
-                recipientsCount: req.body.recipients ? req.body.recipients.length : 0,
-                user: req.currentUser.email
-            });
-
             const campaignData = {
                 ...req.body,
                 createdBy: req.currentUser.email
             };
 
             const campaign = campaignManager.createCampaign(campaignData);
-            console.log('Campaign object created successfully:', campaign.id);
-
-            // Log activity
-            if (activityLogger && activityLogger.logCampaignCreate) {
-                await activityLogger.logCampaignCreate(
-                    req.currentUser.email,
-                    campaign.id,
-                    campaign.name,
-                    campaign.recipients.length
-                );
-                console.log('Activity log entry created for campaign creation');
-            } else if (activityLogger && activityLogger.logCampaign) {
-                await activityLogger.logCampaign(
-                    req.currentUser.email,
-                    'create',
-                    campaign.id,
-                    { name: campaign.name, recipientCount: campaign.recipients.length }
-                );
-                console.log('Activity log entry created (CAMPAIGN_CREATE)');
-            }
-
             res.status(201).json(campaign);
         } catch (error) {
-            console.error('ERROR in POST /campaigns:', error);
-            log(`Error creating campaign: ${error.message}`, 'SYSTEM', {
-                error: error.message,
-                stack: error.stack,
-                body: req.body
-            }, 'ERROR');
             res.status(400).json({ status: 'error', message: error.message });
         }
     });
 
-    router.put('/campaigns/:id', checkCampaignAccess, async (req, res) => {
+    router.put('/campaigns/:id', checkSessionOrTokenAuth, async (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid campaign ID format' });
         }
         try {
-            console.log(`Campaign PUT request received for ${req.params.id}`);
             const campaign = campaignManager.loadCampaign(req.params.id);
             if (!campaign) {
                 return res.status(404).json({ status: 'error', message: 'Campaign not found' });
@@ -597,20 +689,13 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
             }
 
             const updated = campaignManager.updateCampaign(req.params.id, req.body);
-            console.log('Campaign updated successfully:', updated.id);
             res.json(updated);
         } catch (error) {
-            console.error(`ERROR in PUT /campaigns/${req.params.id}:`, error);
-            log(`Error updating campaign ${req.params.id}: ${error.message}`, 'SYSTEM', {
-                error: error.message,
-                stack: error.stack,
-                body: req.body
-            }, 'ERROR');
             res.status(400).json({ status: 'error', message: error.message });
         }
     });
 
-    router.delete('/campaigns/:id', checkCampaignAccess, async (req, res) => {
+    router.delete('/campaigns/:id', checkSessionOrTokenAuth, async (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid campaign ID format' });
         }
@@ -624,79 +709,93 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
             return res.status(403).json({ status: 'error', message: 'Access denied' });
         }
 
-        campaignManager.deleteCampaign(req.params.id);
-
-        // Log activity
-        await activityLogger.logCampaignDelete(
-            req.currentUser.email,
-            req.params.id,
-            campaign.name
-        );
-
-        res.json({ status: 'success', message: 'Campaign deleted' });
+        const success = campaignManager.deleteCampaign(req.params.id);
+        if (success) {
+            res.json({ status: 'success', message: 'Campaign deleted' });
+        } else {
+            res.status(500).json({ status: 'error', message: 'Failed to delete campaign' });
+        }
     });
 
-    router.post('/campaigns/:id/clone', checkCampaignAccess, async (req, res) => {
+    router.post('/campaigns/:id/clone', checkSessionOrTokenAuth, async (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid campaign ID format' });
         }
         try {
-            const cloned = campaignManager.cloneCampaign(req.params.id, req.currentUser.email);
+            const cloned = campaignManager.cloneCampaign(req.params.id, req.currentUser.email, req.body.name);
             res.status(201).json(cloned);
         } catch (error) {
             res.status(400).json({ status: 'error', message: error.message });
         }
     });
 
-    router.post('/campaigns/:id/send', checkCampaignAccess, async (req, res) => {
+    router.post('/campaigns/:id/send', checkSessionOrTokenAuth, async (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid campaign ID format' });
         }
+        const campaign = campaignManager.loadCampaign(req.params.id);
+        if (!campaign) {
+            return res.status(404).json({ status: 'error', message: 'Campaign not found' });
+        }
+
+        // Check access
+        if (req.currentUser.role !== 'admin' && campaign.createdBy !== req.currentUser.email) {
+            return res.status(403).json({ status: 'error', message: 'Access denied' });
+        }
+
         try {
-            console.log(`Starting campaign ${req.params.id} via API request by ${req.currentUser.email}`);
-            const result = await campaignSender.startCampaign(req.params.id, req.currentUser.email);
-            res.json(result);
+            campaignSender.startCampaign(req.params.id);
+            res.json({ status: 'success', message: 'Campaign started' });
         } catch (error) {
-            console.error(`ERROR starting campaign ${req.params.id}:`, error);
-            log(`Failed to start campaign ${req.params.id}: ${error.message}`, 'SYSTEM', {
-                error: error.message,
-                stack: error.stack,
-                campaignId: req.params.id
-            }, 'ERROR');
             res.status(400).json({ status: 'error', message: error.message });
         }
     });
 
-    router.post('/campaigns/:id/pause', checkCampaignAccess, async (req, res) => {
+    router.post('/campaigns/:id/pause', checkSessionOrTokenAuth, async (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid campaign ID format' });
         }
-        const result = campaignSender.pauseCampaign(req.params.id);
-        if (result) {
-            await activityLogger.logCampaignPause(
-                req.currentUser.email,
-                req.params.id,
-                'Campaign paused by user'
-            );
+        const campaign = campaignManager.loadCampaign(req.params.id);
+        if (!campaign) {
+            return res.status(404).json({ status: 'error', message: 'Campaign not found' });
+        }
+
+        // Check access
+        if (req.currentUser.role !== 'admin' && campaign.createdBy !== req.currentUser.email) {
+            return res.status(403).json({ status: 'error', message: 'Access denied' });
+        }
+
+        try {
+            campaignSender.pauseCampaign(req.params.id);
             res.json({ status: 'success', message: 'Campaign paused' });
-        } else {
-            res.status(400).json({ status: 'error', message: 'Campaign not running' });
+        } catch (error) {
+            res.status(400).json({ status: 'error', message: error.message });
         }
     });
 
-    router.post('/campaigns/:id/resume', checkCampaignAccess, async (req, res) => {
+    router.post('/campaigns/:id/resume', checkSessionOrTokenAuth, async (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid campaign ID format' });
         }
+        const campaign = campaignManager.loadCampaign(req.params.id);
+        if (!campaign) {
+            return res.status(404).json({ status: 'error', message: 'Campaign not found' });
+        }
+
+        // Check access
+        if (req.currentUser.role !== 'admin' && campaign.createdBy !== req.currentUser.email) {
+            return res.status(403).json({ status: 'error', message: 'Access denied' });
+        }
+
         try {
-            const result = await campaignSender.resumeCampaign(req.params.id, req.currentUser.email);
+            campaignSender.resumeCampaign(req.params.id);
             res.json({ status: 'success', message: 'Campaign resumed' });
         } catch (error) {
             res.status(400).json({ status: 'error', message: error.message });
         }
     });
 
-    router.post('/campaigns/:id/retry', checkCampaignAccess, async (req, res) => {
+    router.post('/campaigns/:id/retry', checkSessionOrTokenAuth, async (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid campaign ID format' });
         }
@@ -708,7 +807,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         }
     });
 
-    router.get('/campaigns/:id/status', checkCampaignAccess, (req, res) => {
+    router.get('/campaigns/:id/status', checkSessionOrTokenAuth, (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid campaign ID format' });
         }
@@ -719,7 +818,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         res.json(status);
     });
 
-    router.get('/campaigns/:id/export', checkCampaignAccess, (req, res) => {
+    router.get('/campaigns/:id/export', checkSessionOrTokenAuth, (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid campaign ID format' });
         }
@@ -739,7 +838,99 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         res.send(csv);
     });
 
-    router.post('/campaigns/preview-csv', checkCampaignAccess, upload.single('file'), (req, res) => {
+    // Admin AI Model Management Endpoints
+    router.get('/admin/ai-models', checkSessionOrTokenAuth, requireAdmin, (req, res) => {
+        try {
+            log(`Fetching AI models for admin: ${req.currentUser.email}`, 'SYSTEM');
+            const models = AIModel.getAll();
+            res.json({ status: 'success', data: models });
+        } catch (err) {
+            log(`Error fetching AI models: ${err.message}`, 'SYSTEM', null, 'ERROR');
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    router.post('/admin/ai-models', checkSessionOrTokenAuth, requireAdmin, (req, res) => {
+        try {
+            const validation = validateAIModel(req.body);
+            if (!validation.isValid) {
+                return res.status(422).json({ 
+                    status: 'error', 
+                    message: 'Validation failed', 
+                    details: { errors: validation.errors } 
+                });
+            }
+
+            const model = AIModel.create(req.body);
+            ActivityLog.logAIModel(req.currentUser.email, 'CREATE', model.id, { name: model.name });
+            res.status(201).json({ status: 'success', data: model });
+        } catch (err) {
+            res.status(400).json({ status: 'error', message: err.message });
+        }
+    });
+
+    router.put('/admin/ai-models/:id', checkSessionOrTokenAuth, requireAdmin, (req, res) => {
+        try {
+            const existing = AIModel.findById(req.params.id);
+            if (!existing) return res.status(404).json({ status: 'error', message: 'Model not found' });
+
+            // Validate update - combine existing with updates for validation
+            const updatedData = { ...existing, ...req.body };
+            // If api_key is empty in the request, it means we want to keep the existing one
+            if (req.body.api_key === "" || req.body.api_key === undefined) {
+                updatedData.api_key = existing.api_key;
+            }
+            
+            const validation = validateAIModel(updatedData);
+            if (!validation.isValid) {
+                return res.status(422).json({ 
+                    status: 'error', 
+                    message: 'Validation failed', 
+                    details: { errors: validation.errors } 
+                });
+            }
+            
+            const modelUpdate = { ...req.body };
+            if (modelUpdate.api_key === "" || modelUpdate.api_key === undefined) {
+                delete modelUpdate.api_key;
+            }
+
+            const model = AIModel.update(req.params.id, modelUpdate);
+            ActivityLog.logAIModel(req.currentUser.email, 'UPDATE', req.params.id, { name: model.name });
+            res.json({ status: 'success', data: model });
+        } catch (err) {
+            res.status(400).json({ status: 'error', message: err.message });
+        }
+    });
+
+    router.delete('/admin/ai-models/:id', checkSessionOrTokenAuth, requireAdmin, (req, res) => {
+        try {
+            const model = AIModel.findById(req.params.id);
+            const success = AIModel.delete(req.params.id);
+            if (!success) return res.status(404).json({ status: 'error', message: 'Model not found' });
+            ActivityLog.logAIModel(req.currentUser.email, 'DELETE', req.params.id, { name: model?.name });
+            res.json({ status: 'success', message: 'Model deleted' });
+        } catch (err) {
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    // User-facing AI Model List (Only active models)
+    router.get('/ai-models', checkSessionOrTokenAuth, (req, res) => {
+        try {
+            const models = AIModel.getAll(true);
+            // Don't send sensitive info to regular users
+            const safeModels = models.map(m => {
+                const { api_key, provider, endpoint, ...safe } = m;
+                return safe;
+            });
+            res.json({ status: 'success', data: safeModels });
+        } catch (err) {
+            res.status(500).json({ status: 'error', message: err.message });
+        }
+    });
+
+    router.post('/campaigns/preview-csv', checkSessionOrTokenAuth, upload.single('file'), (req, res) => {
         if (!req.file) {
             return res.status(400).json({ status: 'error', message: 'No file uploaded' });
         }
@@ -769,7 +960,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     // Recipient List Management Endpoints (Session-based auth, not token-based)
 
     // Get all recipient lists
-    router.get('/recipient-lists', checkCampaignAccess, (req, res) => {
+    router.get('/recipient-lists', checkSessionOrTokenAuth, (req, res) => {
         const lists = recipientListManager.getAllLists(
             req.currentUser.email,
             req.currentUser.role === 'admin'
@@ -778,7 +969,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
 
     // Get specific recipient list
-    router.get('/recipient-lists/:id', checkCampaignAccess, (req, res) => {
+    router.get('/recipient-lists/:id', checkSessionOrTokenAuth, (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid list ID format' });
         }
@@ -796,7 +987,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
 
     // Create new recipient list
-    router.post('/recipient-lists', checkCampaignAccess, (req, res) => {
+    router.post('/recipient-lists', checkSessionOrTokenAuth, (req, res) => {
         try {
             const listData = {
                 ...req.body,
@@ -811,7 +1002,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
 
     // Update recipient list
-    router.put('/recipient-lists/:id', checkCampaignAccess, (req, res) => {
+    router.put('/recipient-lists/:id', checkSessionOrTokenAuth, (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid list ID format' });
         }
@@ -834,7 +1025,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
 
     // Delete recipient list
-    router.delete('/recipient-lists/:id', checkCampaignAccess, (req, res) => {
+    router.delete('/recipient-lists/:id', checkSessionOrTokenAuth, (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid list ID format' });
         }
@@ -857,7 +1048,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
 
     // Clone recipient list
-    router.post('/recipient-lists/:id/clone', checkCampaignAccess, (req, res) => {
+    router.post('/recipient-lists/:id/clone', checkSessionOrTokenAuth, (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid list ID format' });
         }
@@ -870,7 +1061,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
 
     // Add recipient to list
-    router.post('/recipient-lists/:id/recipients', checkCampaignAccess, (req, res) => {
+    router.post('/recipient-lists/:id/recipients', checkSessionOrTokenAuth, (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid list ID format' });
         }
@@ -893,7 +1084,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
 
     // Update recipient in list
-    router.put('/recipient-lists/:id/recipients/:number', checkCampaignAccess, (req, res) => {
+    router.put('/recipient-lists/:id/recipients/:number', checkSessionOrTokenAuth, (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid list ID format' });
         }
@@ -920,7 +1111,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
 
     // Remove recipient from list
-    router.delete('/recipient-lists/:id/recipients/:number', checkCampaignAccess, (req, res) => {
+    router.delete('/recipient-lists/:id/recipients/:number', checkSessionOrTokenAuth, (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid list ID format' });
         }
@@ -946,7 +1137,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
 
     // Search recipients across all lists
-    router.get('/recipient-lists/search/:query', checkCampaignAccess, (req, res) => {
+    router.get('/recipient-lists/search/:query', checkSessionOrTokenAuth, (req, res) => {
         const results = recipientListManager.searchRecipients(
             req.params.query,
             req.currentUser.email,
@@ -956,7 +1147,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
 
     // Get recipient lists statistics
-    router.get('/recipient-lists-stats', checkCampaignAccess, (req, res) => {
+    router.get('/recipient-lists-stats', checkSessionOrTokenAuth, (req, res) => {
         const stats = recipientListManager.getStatistics(
             req.currentUser.email,
             req.currentUser.role === 'admin'
@@ -965,7 +1156,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
 
     // Mark recipient list as used
-    router.post('/recipient-lists/:id/mark-used', checkCampaignAccess, (req, res) => {
+    router.post('/recipient-lists/:id/mark-used', checkSessionOrTokenAuth, (req, res) => {
         if (!isValidId(req.params.id)) {
             return res.status(400).json({ status: 'error', message: 'Invalid list ID format' });
         }
@@ -984,7 +1175,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
 
     // Debug endpoint to check session status
-    router.get('/debug/sessions', checkCampaignAccess, (req, res) => {
+    router.get('/debug/sessions', checkSessionOrTokenAuth, requireAdmin, (req, res) => {
         const debugInfo = {};
         sessions.forEach((session, sessionId) => {
             debugInfo[sessionId] = {
@@ -998,24 +1189,15 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         res.json(debugInfo);
     });
 
-    // All routes below this are protected by token
-    router.use(validateToken);
-
-    router.delete('/sessions/:sessionId', async (req, res) => {
+    router.delete('/sessions/:sessionId', checkSessionOrTokenAuth, async (req, res) => {
         log('API request', 'SYSTEM', { event: 'api-request', method: req.method, endpoint: req.originalUrl, params: req.params });
         const { sessionId } = req.params;
 
-        // Get current user from session
-        const currentUser = req.session && req.session.adminAuthed ? {
-            email: req.session.userEmail,
-            role: req.session.userRole
-        } : null;
-
         try {
             // Check ownership if user is authenticated
-            if (currentUser && currentUser.role !== 'admin' && userManager) {
+            if (req.currentUser && req.currentUser.role !== 'admin' && userManager) {
                 const sessionOwner = userManager.getSessionOwner(sessionId);
-                if (sessionOwner && sessionOwner.email !== currentUser.email) {
+                if (sessionOwner && sessionOwner.email !== req.currentUser.email) {
                     return res.status(403).json({
                         status: 'error',
                         message: 'You can only delete your own sessions'
@@ -1026,9 +1208,9 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
             await deleteSession(sessionId);
 
             // Log activity
-            if (currentUser && activityLogger) {
+            if (req.currentUser && activityLogger) {
                 await activityLogger.logSessionDelete(
-                    currentUser.email,
+                    req.currentUser.email,
                     sessionId,
                     req.ip,
                     req.headers['user-agent']
@@ -1043,21 +1225,61 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         }
     });
 
-    async function sendMessage(sock, to, message) {
+    async function sendMessage(sock, to, message, sessionId, req) {
         try {
-            const jid = jidNormalizedUser(to);
-            console.log(`[API] Attempting to send message to ${jid}`);
+            // Robust JID handling: only normalize if it's a user JID, otherwise use as is
+            const jid = to.endsWith('@g.us') ? to : jidNormalizedUser(to);
+            
+            if (!jid) {
+                throw new Error(`Invalid JID: ${to}`);
+            }
+
+            log(`[API] Tentative d'envoi de message vers ${jid}`, 'SYSTEM', { to: jid }, 'DEBUG');
+            
+            // Log message structure for debugging
+            log(`[API] Structure du message: ${JSON.stringify(message)}`, 'SYSTEM', { message }, 'DEBUG');
+
             const result = await sock.sendMessage(jid, message);
-            console.log(`[API] Message sent successfully to ${jid}, ID: ${result.key.id}`);
-            return { status: 'success', message: `Message sent to ${to}`, messageId: result.key.id };
+            
+            if (!result) {
+                throw new Error('Baileys a retourné un résultat vide');
+            }
+
+            // Log to activity log
+            if (activityLogger) {
+                const userEmail = req.currentUser ? req.currentUser.email : (req.session?.userEmail || 'api-key');
+                
+                await activityLogger.logMessageSend(
+                    userEmail,
+                    sessionId,
+                    jid,
+                    Object.keys(message)[0] || 'unknown',
+                    req.ip,
+                    req.headers['user-agent']
+                );
+            }
+
+            log(`[API] Message envoyé avec succès à ${jid}, ID: ${result.key.id}`, 'SYSTEM', { to: jid, messageId: result.key.id }, 'INFO');
+            return { 
+                status: 'success', 
+                message: `Message envoyé à ${to}`, 
+                messageId: result.key.id,
+                result: result 
+            };
         } catch (error) {
-            console.error(`[API] Failed to send message to ${to}:`, error);
-            return { status: 'error', message: `Failed to send message to ${to}. Reason: ${error.message}` };
+            log(`[API] Échec de l'envoi du message à ${to}: ${error.message}`, 'SYSTEM', { to, error: error.message }, 'ERROR');
+            // Check for specific Baileys error types if possible
+            const errorDetail = error.stack || error.message;
+            return { 
+                status: 'error', 
+                message: `Failed to send message to ${to}. Reason: ${error.message}`,
+                detail: errorDetail
+            };
         }
     }
 
     // Webhook setup endpoint
-    router.post('/webhook', (req, res) => {
+    router.post('/webhook', checkSessionOrTokenAuth, (req, res) => {
         log('API request', 'SYSTEM', { event: 'api-request', method: req.method, endpoint: req.originalUrl, body: req.body });
         const { url, sessionId } = req.body;
         if (!url || !sessionId) {
@@ -1070,7 +1292,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
 
     // Add GET and DELETE endpoints for webhook management
-    router.get('/webhook', (req, res) => {
+    router.get('/webhook', checkSessionOrTokenAuth, (req, res) => {
         const { sessionId } = req.query;
         if (!sessionId) {
             return res.status(400).json({ status: 'error', message: 'sessionId is required.' });
@@ -1079,7 +1301,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         res.status(200).json({ status: 'success', sessionId, url });
     });
 
-    router.delete('/webhook', (req, res) => {
+    router.delete('/webhook', checkSessionOrTokenAuth, (req, res) => {
         const { sessionId } = req.body;
         if (!sessionId) {
             return res.status(400).json({ status: 'error', message: 'sessionId is required.' });
@@ -1090,7 +1312,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
 
     // Hardened media upload endpoint (validation handled by multer fileFilter)
-    router.post('/media', upload.single('file'), (req, res) => {
+    router.post('/media', checkSessionOrTokenAuth, upload.single('file'), (req, res) => {
         log('API request', 'SYSTEM', { event: 'api-request', method: req.method, endpoint: req.originalUrl, body: req.body });
         if (!req.file) {
             log('API error', 'SYSTEM', { event: 'api-error', error: 'No file uploaded or invalid file type.', endpoint: req.originalUrl });
@@ -1107,7 +1329,7 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
     });
 
     // Main message sending endpoint
-    router.post('/messages', async (req, res) => {
+    router.post('/messages', checkSessionOrTokenAuth, async (req, res) => {
         log('API request', 'SYSTEM', { event: 'api-request', method: req.method, endpoint: req.originalUrl, query: req.query });
         const { sessionId } = req.query;
         if (!sessionId) {
@@ -1115,12 +1337,12 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
             return res.status(400).json({ status: 'error', message: 'sessionId query parameter is required' });
         }
         const session = sessions.get(sessionId);
-        console.log(`[API] Message request for session ${sessionId}:`, {
+        log(`[API] Requête de message pour la session ${sessionId}`, sessionId, {
             exists: !!session,
             status: session?.status,
             hasSock: !!session?.sock,
             sockConnected: session?.sock?.user ? 'yes' : 'no'
-        });
+        }, 'DEBUG');
 
         if (!session || !session.sock || session.status !== 'CONNECTED') {
             log('API error', 'SYSTEM', { 
@@ -1143,437 +1365,43 @@ function initializeApi(sessions, sessionTokens, createSession, getSessionsDetail
         const messageContents = []; // Track message contents with formatting
 
         for (const msg of messages) {
-            const { recipient_type, to, type, text, image, document } = msg;
+            const { recipient_type, to, type, text } = msg;
+            const msgImage = msg.image;
+            const msgDocument = msg.document;
+            const msgAudio = msg.audio;
+            const msgVideo = msg.video;
+
             // Input validation
             if (!to || !type) {
-                results.push({ status: 'error', message: 'Invalid message format. "to" and "type" are required.' });
+                results.push({ status: 'error', message: 'Recipient (to) and type are required' });
                 continue;
             }
-
-            // Clean number for validation if not a group
-            const isGroup = to.endsWith('@g.us') || recipient_type === 'group';
-            const validationTarget = isGroup ? to : to.replace(/\D/g, '');
-
-            if (!isGroup && (validationTarget.length < 8 || validationTarget.length > 15)) {
-                results.push({ status: 'error', message: 'Invalid phone number format. Must be 8-15 digits.' });
-                continue;
-            }
-            
-            if (isGroup && !to.includes('@g.us') && !validator.isNumeric(to)) {
-                 results.push({ status: 'error', message: 'Invalid group ID format.' });
-                 continue;
-            }
-
-            // Add phone number to the list for logging
-            phoneNumbers.push(to);
-
-            // Track message content based on type
-            let messageContent = {
-                type: type,
-                to: to
-            };
-
-            if (type === 'text') {
-                if (!text || typeof text.body !== 'string' || text.body.length === 0 || text.body.length > 4096) {
-                    results.push({ status: 'error', message: 'Invalid text message content.' });
-                    continue;
-                }
-                messageContent.text = text.body; // Preserve formatting
-            }
-            if (type === 'image' && image) {
-                if (image.id && !validator.isAlphanumeric(image.id.replace(/[\.\-]/g, ''))) {
-                    results.push({ status: 'error', message: 'Invalid image ID.' });
-                    continue;
-                }
-                if (image.link && !validator.isURL(image.link)) {
-                    results.push({ status: 'error', message: 'Invalid image URL.' });
-                    continue;
-                }
-                messageContent.image = {
-                    caption: image.caption || '',
-                    url: image.link || `/media/${image.id}` // Convert media ID to URL for display
-                };
-            }
-            if (type === 'document' && document) {
-                if (document.id && !validator.isAlphanumeric(document.id.replace(/[\.\-]/g, ''))) {
-                    results.push({ status: 'error', message: 'Invalid document ID.' });
-                    continue;
-                }
-                if (document.link && !validator.isURL(document.link)) {
-                    results.push({ status: 'error', message: 'Invalid document URL.' });
-                    continue;
-                }
-                messageContent.document = {
-                    filename: document.filename || 'document',
-                    url: document.link || `/media/${document.id}` // Convert media ID to URL for display
-                };
-            }
-
-            if (type === 'audio' && msg.audio) {
-                const audio = msg.audio;
-                if (audio.id && !validator.isAlphanumeric(audio.id.replace(/[\.\-]/g, ''))) {
-                    results.push({ status: 'error', message: 'Invalid audio ID.' });
-                    continue;
-                }
-                if (audio.link && !validator.isURL(audio.link)) {
-                    results.push({ status: 'error', message: 'Invalid audio URL.' });
-                    continue;
-                }
-                messageContent.audio = {
-                    url: audio.link || `/media/${audio.id}`
-                };
-            }
-
-            if (type === 'video' && msg.video) {
-                const video = msg.video;
-                if (video.id && !validator.isAlphanumeric(video.id.replace(/[\.\-]/g, ''))) {
-                    results.push({ status: 'error', message: 'Invalid video ID.' });
-                    continue;
-                }
-                if (video.link && !validator.isURL(video.link)) {
-                    results.push({ status: 'error', message: 'Invalid video URL.' });
-                    continue;
-                }
-                messageContent.video = {
-                    caption: video.caption || '',
-                    url: video.link || `/media/${video.id}`
-                };
-            }
-
-            messageContents.push(messageContent);
-
-            let destination;
-            if (recipient_type === 'group') {
-                destination = to.endsWith('@g.us') ? to : `${to}@g.us`;
-            } else {
-                // Clean the number from any special characters except digits
-                const cleanNumber = to.replace(/\D/g, '');
-                destination = `${cleanNumber}@s.whatsapp.net`;
-            }
-
-            let messagePayload;
-            let options = {};
 
             try {
-                switch (type) {
-                    case 'text':
-                        if (!text || !text.body) {
-                            throw new Error('For "text" type, "text.body" is required.');
-                        }
-                        messagePayload = { text: text.body };
-                        break;
-
-                    case 'image':
-                        if (!image || (!image.link && !image.id)) {
-                            throw new Error('For "image" type, "image.link" or "image.id" is required.');
-                        }
-                        let imageUrl = image.link;
-                        if (image.id) {
-                            const fullPath = path.resolve(mediaDir, image.id);
-                            console.log(`[API] Checking image file: ${fullPath}`);
-                            if (!fs.existsSync(fullPath)) {
-                                throw new Error(`Image file not found: ${image.id}`);
-                            }
-                            imageUrl = fullPath;
-                            if (process.platform === 'win32') {
-                                imageUrl = imageUrl.replace(/\\/g, '/');
-                            }
-                        }
-                        console.log(`[API] Sending image from: ${imageUrl}`);
-                        messagePayload = { image: { url: imageUrl }, caption: image.caption };
-                        break;
-
-                    case 'document':
-                        if (!document || (!document.link && !document.id)) {
-                            throw new Error('For "document" type, "document.link" or "document.id" is required.');
-                        }
-                        let docUrl = document.link;
-                        if (document.id) {
-                            const fullPath = path.resolve(mediaDir, document.id);
-                            console.log(`[API] Checking document file: ${fullPath}`);
-                            if (!fs.existsSync(fullPath)) {
-                                throw new Error(`Document file not found: ${document.id}`);
-                            }
-                            docUrl = fullPath;
-                            if (process.platform === 'win32') {
-                                docUrl = docUrl.replace(/\\/g, '/');
-                            }
-                        }
-                        console.log(`[API] Sending document from: ${docUrl}`);
-                        messagePayload = { 
-                            document: { url: docUrl }, 
-                            mimetype: document.mimetype || 'application/octet-stream', 
-                            fileName: document.filename || (document.id ? document.id : 'document')
-                        };
-                        break;
-
-                    case 'audio':
-                        const audio = msg.audio;
-                        if (!audio || (!audio.link && !audio.id)) {
-                            throw new Error('For "audio" type, "audio.link" or "audio.id" is required.');
-                        }
-                        let audioUrl = audio.link;
-                        if (audio.id) {
-                            const fullPath = path.resolve(mediaDir, audio.id);
-                            console.log(`[API] Checking audio file: ${fullPath}`);
-                            if (!fs.existsSync(fullPath)) {
-                                throw new Error(`Audio file not found: ${audio.id}`);
-                            }
-                            audioUrl = fullPath;
-                            if (process.platform === 'win32') {
-                                audioUrl = audioUrl.replace(/\\/g, '/');
-                            }
-                        }
-                        console.log(`[API] Sending audio from: ${audioUrl}`);
-                        messagePayload = { audio: { url: audioUrl }, mimetype: audio.mimetype || 'audio/mp4', ptt: audio.ptt || false };
-                        break;
-
-                    case 'video':
-                        const video = msg.video;
-                        if (!video || (!video.link && !video.id)) {
-                            throw new Error('For "video" type, "video.link" or "video.id" is required.');
-                        }
-                        let videoUrl = video.link;
-                        if (video.id) {
-                            const fullPath = path.resolve(mediaDir, video.id);
-                            console.log(`[API] Checking video file: ${fullPath}`);
-                            if (!fs.existsSync(fullPath)) {
-                                throw new Error(`Video file not found: ${video.id}`);
-                            }
-                            videoUrl = fullPath;
-                            if (process.platform === 'win32') {
-                                videoUrl = videoUrl.replace(/\\/g, '/');
-                            }
-                        }
-                        console.log(`[API] Sending video from: ${videoUrl}`);
-                        messagePayload = { video: { url: videoUrl }, caption: video.caption, mimetype: video.mimetype || 'video/mp4' };
-                        break;
-
-                    default:
-                        throw new Error(`Unsupported message type: ${type}`);
+                let result;
+                if (type === 'text') {
+                    result = await sendMessage(session.sock, to, { text: text }, sessionId, req);
+                } else if (type === 'image') {
+                    result = await sendMessage(session.sock, to, { image: { url: msgImage.url }, caption: msgImage.caption }, sessionId, req);
+                } else if (type === 'document') {
+                    result = await sendMessage(session.sock, to, { document: { url: msgDocument.url }, fileName: msgDocument.fileName, mimetype: msgDocument.mimetype }, sessionId, req);
+                } else if (type === 'audio') {
+                    result = await sendMessage(session.sock, to, { audio: { url: msgAudio.url }, mimetype: msgAudio.mimetype, ptt: msgAudio.ptt }, sessionId, req);
+                } else if (type === 'video') {
+                    result = await sendMessage(session.sock, to, { video: { url: msgVideo.url }, caption: msgVideo.caption }, sessionId, req);
+                } else {
+                    result = { status: 'error', message: `Unsupported message type: ${type}` };
                 }
-
-                const result = await sendMessage(session.sock, destination, messagePayload);
                 results.push(result);
-
             } catch (error) {
-                results.push({ status: 'error', message: `Failed to process message for ${to}: ${error.message}` });
+                results.push({ status: 'error', message: error.message });
             }
         }
 
-        // Log activity for each successful message
-        if (activityLogger) {
-            const currentUser = req.session && req.session.adminAuthed ? req.session.userEmail : null;
-            const sessionOwner = userManager ? userManager.getSessionOwner(sessionId) : null;
-            const userEmail = currentUser || (sessionOwner ? sessionOwner.email : 'api-user');
-
-            for (let i = 0; i < results.length; i++) {
-                if (results[i].status === 'success') {
-                    await activityLogger.logMessageSend(
-                        userEmail,
-                        sessionId,
-                        phoneNumbers[i],
-                        messages[i].type,
-                        req.ip,
-                        req.headers['user-agent']
-                    );
-                }
-            }
-        }
-
-        log('Messages sent', sessionId, {
-            event: 'messages-sent',
-            sessionId,
-            count: results.length,
-            phoneNumbers: phoneNumbers,
-            messages: messageContents
-        });
-        res.status(200).json(results);
-    });
-
-    router.delete('/message', async (req, res) => {
-        log('API request', 'SYSTEM', { event: 'api-request', method: req.method, endpoint: req.originalUrl, body: req.body });
-        const { sessionId, messageId, remoteJid } = req.body;
-
-        if (!sessionId || !messageId || !remoteJid) {
-            log('API error', 'SYSTEM', { event: 'api-error', error: 'sessionId, messageId, and remoteJid are required.', endpoint: req.originalUrl });
-            return res.status(400).json({ status: 'error', message: 'sessionId, messageId, and remoteJid are required.' });
-        }
-
-        const session = sessions.get(sessionId);
-        if (!session || !session.sock || session.status !== 'CONNECTED') {
-            log('API error', 'SYSTEM', { event: 'api-error', error: `Session ${sessionId} not found or not connected.`, endpoint: req.originalUrl });
-            return res.status(404).json({ status: 'error', message: `Session ${sessionId} not found or not connected.` });
-        }
-
-        try {
-            await session.sock.chatModify({
-                clear: { messages: [{ id: messageId, fromMe: true, timestamp: 0 }] }
-            }, remoteJid);
-
-            // The above is for clearing. For actual deletion:
-            await session.sock.sendMessage(remoteJid, { delete: { remoteJid: remoteJid, fromMe: true, id: messageId } });
-
-            log('Message deleted', messageId, { event: 'message-deleted', messageId, sessionId });
-            res.status(200).json({ status: 'success', message: `Attempted to delete message ${messageId}` });
-        } catch (error) {
-            log('API error', 'SYSTEM', { event: 'api-error', error: error.message, endpoint: req.originalUrl });
-            console.error(`Failed to delete message ${messageId}:`, error);
-            res.status(500).json({ status: 'error', message: `Failed to delete message. Reason: ${error.message}` });
-        }
-    });
-
-    // Make campaign sender available for WebSocket updates
-    router.campaignSender = campaignSender;
-
-    // ============================================
-    // LEGACY API ENDPOINTS (merged from legacy_api.js)
-    // ============================================
-
-    // Legacy rate limiter (stricter for these endpoints)
-    const legacyLimiter = rateLimit({
-        windowMs: 1 * 60 * 1000,
-        max: 10,
-        message: { status: 'error', message: 'Too many requests, please try again later.' },
-        standardHeaders: true,
-        legacyHeaders: false,
-        validate: { trustProxy: false }
-    });
-
-    // Legacy JSON endpoint: POST /legacy/send-message
-    router.post('/legacy/send-message', legacyLimiter, validateToken, express.json(), async (req, res) => {
-        const { sessionId, number, message } = req.body;
-
-        if (!sessionId || !number || !message) {
-            return res.status(400).json({ status: 'error', message: 'sessionId, number, and message are required.' });
-        }
-
-        // Input validation
-        const cleanNumber = number.replace(/\D/g, '');
-        if (cleanNumber.length < 8 || cleanNumber.length > 15) {
-            return res.status(400).json({ status: 'error', message: 'Invalid phone number format.' });
-        }
-        if (typeof message !== 'string' || message.length === 0 || message.length > 4096) {
-            return res.status(400).json({ status: 'error', message: 'Invalid message content.' });
-        }
-
-        const session = sessions.get(sessionId);
-        if (!session || !session.sock || session.status !== 'CONNECTED') {
-            return res.status(404).json({ status: 'error', message: `Session ${sessionId} not found or not connected.` });
-        }
-
-        try {
-            const destination = `${cleanNumber}@s.whatsapp.net`;
-            const result = await sendMessage(session.sock, destination, { text: message });
-            res.status(200).json(result);
-        } catch (error) {
-            console.error(`Failed to send legacy message to ${number}:`, error);
-            res.status(500).json({ status: 'error', message: `Failed to send message: ${error.message}` });
-        }
-    });
-
-    // Legacy form-data endpoint: POST /legacy/message
-    router.post('/legacy/message', legacyLimiter, validateToken, multer().none(), async (req, res) => {
-        const { phone, message, sessionId } = req.body;
-        const targetSessionId = sessionId || 'putra';
-
-        if (!phone || !message) {
-            return res.status(400).json({ status: 'error', message: 'phone and message are required.' });
-        }
-
-        // Input validation
-        const cleanPhone = phone.replace(/\D/g, '');
-        if (cleanPhone.length < 8 || cleanPhone.length > 15) {
-            return res.status(400).json({ status: 'error', message: 'Invalid phone number format.' });
-        }
-        if (typeof message !== 'string' || message.length === 0 || message.length > 4096) {
-            return res.status(400).json({ status: 'error', message: 'Invalid message content.' });
-        }
-
-        const session = sessions.get(targetSessionId);
-        if (!session || !session.sock || session.status !== 'CONNECTED') {
-            return res.status(404).json({ status: 'error', message: `Session ${targetSessionId} not found or not connected.` });
-        }
-
-        try {
-            const destination = `${cleanPhone}@s.whatsapp.net`;
-            const result = await sendMessage(session.sock, destination, { text: message });
-            res.status(200).json(result);
-        } catch (error) {
-            console.error(`Failed to send legacy message to ${phone}:`, error);
-            res.status(500).json({ status: 'error', message: `Failed to send message: ${error.message}` });
-        }
-    });
-
-    // Legacy JSON endpoint: POST /legacy/send-audio
-    router.post('/legacy/send-audio', legacyLimiter, validateToken, express.json(), async (req, res) => {
-        const { sessionId, number, url, id, ptt } = req.body;
-
-        if (!sessionId || !number || (!url && !id)) {
-            return res.status(400).json({ status: 'error', message: 'sessionId, number, and (url or id) are required.' });
-        }
-
-        const cleanNumber = number.replace(/\D/g, '');
-        const session = sessions.get(sessionId);
-        if (!session || !session.sock || session.status !== 'CONNECTED') {
-            return res.status(404).json({ status: 'error', message: `Session ${sessionId} not found or not connected.` });
-        }
-
-        try {
-            const destination = `${cleanNumber}@s.whatsapp.net`;
-            let audioUrl = url;
-            if (id) {
-                const fullPath = path.resolve(mediaDir, id);
-                if (!fs.existsSync(fullPath)) throw new Error('Audio file not found');
-                audioUrl = fullPath;
-                if (process.platform === 'win32') audioUrl = audioUrl.replace(/\\/g, '/');
-            }
-            const result = await sendMessage(session.sock, destination, { 
-                audio: { url: audioUrl }, 
-                mimetype: req.body.mimetype || 'audio/mp4',
-                ptt: ptt || false 
-            });
-            res.status(200).json(result);
-        } catch (error) {
-            res.status(500).json({ status: 'error', message: error.message });
-        }
-    });
-
-    // Legacy JSON endpoint: POST /legacy/send-video
-    router.post('/legacy/send-video', legacyLimiter, validateToken, express.json(), async (req, res) => {
-        const { sessionId, number, url, id, caption } = req.body;
-
-        if (!sessionId || !number || (!url && !id)) {
-            return res.status(400).json({ status: 'error', message: 'sessionId, number, and (url or id) are required.' });
-        }
-
-        const cleanNumber = number.replace(/\D/g, '');
-        const session = sessions.get(sessionId);
-        if (!session || !session.sock || session.status !== 'CONNECTED') {
-            return res.status(404).json({ status: 'error', message: `Session ${sessionId} not found or not connected.` });
-        }
-
-        try {
-            const destination = `${cleanNumber}@s.whatsapp.net`;
-            let videoUrl = url;
-            if (id) {
-                const fullPath = path.resolve(mediaDir, id);
-                if (!fs.existsSync(fullPath)) throw new Error('Video file not found');
-                videoUrl = fullPath;
-                if (process.platform === 'win32') videoUrl = videoUrl.replace(/\\/g, '/');
-            }
-            const result = await sendMessage(session.sock, destination, { 
-                video: { url: videoUrl }, 
-                caption: caption || '',
-                mimetype: req.body.mimetype || 'video/mp4'
-            });
-            res.status(200).json(result);
-        } catch (error) {
-            res.status(500).json({ status: 'error', message: error.message });
-        }
+        res.json({ status: 'success', results });
     });
 
     return router;
 }
 
-module.exports = { initializeApi, getWebhookUrl }; 
+module.exports = { initializeApi, getWebhookUrl };

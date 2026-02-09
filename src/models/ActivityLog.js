@@ -1,9 +1,10 @@
 /**
- * ActivityLog Model
+ * Activity Log Model
  * SQLite-based activity logging
  */
 
 const { db } = require('../config/database');
+const { log } = require('../utils/logger');
 
 class ActivityLog {
     /**
@@ -38,7 +39,7 @@ class ActivityLog {
      * @returns {array} Array of activities
      */
     static getAll(options = {}) {
-        const { userEmail, action, resource, startDate, endDate, limit = 100 } = options;
+        const { userEmail, action, resource, startDate, endDate, limit = 100, offset = 0 } = options;
 
         let sql = 'SELECT * FROM activity_logs WHERE 1=1';
         const params = [];
@@ -68,14 +69,29 @@ class ActivityLog {
             params.push(endDate);
         }
 
-        sql += ' ORDER BY created_at DESC LIMIT ?';
+        sql += ' ORDER BY created_at DESC LIMIT ? OFFSET ?';
         params.push(limit);
+        params.push(offset);
 
         const stmt = db.prepare(sql);
         return stmt.all(...params).map(row => ({
             ...row,
             details: row.details ? JSON.parse(row.details) : null
         }));
+    }
+
+    /**
+     * Get all logs with pagination (Alias for api.js)
+     */
+    static getLogs(limit = 100, offset = 0) {
+        return this.getAll({ limit, offset });
+    }
+
+    /**
+     * Get user specific logs with pagination (Alias for api.js)
+     */
+    static getUserLogs(userEmail, limit = 100, offset = 0) {
+        return this.getAll({ userEmail, limit, offset });
     }
 
     /**
@@ -90,7 +106,7 @@ class ActivityLog {
         date.setDate(date.getDate() - (parseInt(days) || 7));
         const dateLimit = date.toISOString().replace('T', ' ').split('.')[0];
 
-        console.log(`[ActivityLog] Generating summary for ${days} days (since ${dateLimit} UTC)`);
+        log(`[ActivityLog] Génération du résumé pour ${days} jours (depuis ${dateLimit} UTC)`, 'SYSTEM', { days, since: dateLimit }, 'DEBUG');
 
         let sqlBase = `FROM activity_logs WHERE created_at >= ?`;
         const params = [dateLimit];
@@ -105,7 +121,7 @@ class ActivityLog {
             const totalResult = totalStmt.get(...params);
             const totalActivities = totalResult ? totalResult.count : 0;
 
-            console.log(`[ActivityLog] Total activities in range: ${totalActivities}`);
+            log(`[ActivityLog] Total des activités dans la période: ${totalActivities}`, 'SYSTEM', { totalActivities }, 'DEBUG');
 
             // 2. Group by action (with normalization for cards)
             const actionStmt = db.prepare(`SELECT action, COUNT(*) as count ${sqlBase} GROUP BY action`);
@@ -134,13 +150,20 @@ class ActivityLog {
                 return acc;
             }, {});
 
+            // 4. Success rate
+            const successStmt = db.prepare(`SELECT COUNT(*) as count ${sqlBase} AND success = 1`);
+            const successResult = successStmt.get(...params);
+            const successCount = successResult ? successResult.count : 0;
+            const successRate = totalActivities > 0 ? Math.round((successCount / totalActivities) * 100) : 100;
+
             return {
                 totalActivities,
+                successRate,
                 byUser,
                 byAction
             };
         } catch (error) {
-            console.error('[ActivityLog] ERROR in getSummary:', error);
+            log(`[ActivityLog] ERREUR dans getSummary: ${error.message}`, 'SYSTEM', { error: error.message }, 'ERROR');
             return { totalActivities: 0, byUser: {}, byAction: {} };
         }
     }
@@ -249,6 +272,19 @@ class ActivityLog {
 
     static logCampaignMessage(userEmail, campaignId, recipient, status, error = null) {
         return this.logCampaign(userEmail, 'MESSAGE', campaignId, { recipient, status, error });
+    }
+
+    /**
+     * Helper: Log AI Model management action
+     */
+    static logAIModel(userEmail, action, modelId, details = null) {
+        return this.log({
+            userEmail,
+            action: `AI_MODEL_${action.toUpperCase()}`,
+            resource: 'ai_model',
+            resourceId: modelId,
+            details
+        });
     }
 
     /**

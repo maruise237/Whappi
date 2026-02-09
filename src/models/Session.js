@@ -5,9 +5,10 @@
  */
 
 const { db } = require('../config/database');
-const crypto = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
+const { log } = require('../utils/logger');
 
 const SESSION_DIR = path.join(process.cwd(), 'auth_info_baileys');
 
@@ -21,19 +22,29 @@ class Session {
     static create(sessionId, ownerEmail = null) {
         const existingSession = this.findById(sessionId);
         if (existingSession) {
-            throw new Error('Session already exists');
+            return existingSession; // Just return if already exists
         }
 
         const token = crypto.randomUUID();
 
         const stmt = db.prepare(`
             INSERT INTO whatsapp_sessions (id, owner_email, token, status, created_at, updated_at)
-            VALUES (?, ?, ?, 'CREATING', datetime('now'), datetime('now'))
+            VALUES (?, ?, ?, 'DISCONNECTED', datetime('now'), datetime('now'))
         `);
 
         stmt.run(sessionId, ownerEmail, token);
 
         return this.findById(sessionId);
+    }
+
+    /**
+     * Find session by owner email
+     * @param {string} email - Owner email
+     * @returns {object|null} Session object or null
+     */
+    static findByOwnerEmail(email) {
+        const stmt = db.prepare('SELECT * FROM whatsapp_sessions WHERE owner_email = ?');
+        return stmt.get(email?.toLowerCase());
     }
 
     /**
@@ -77,16 +88,96 @@ class Session {
      * @param {string} sessionId - Session ID
      * @param {string} status - New status
      * @param {string} detail - Status detail
+     * @param {string} pairingCode - Optional pairing code
      * @returns {object} Updated session
      */
-    static updateStatus(sessionId, status, detail = null) {
+    static updateStatus(sessionId, status, detail = null, pairingCode = null) {
+        if (pairingCode) {
+            const stmt = db.prepare(`
+                UPDATE whatsapp_sessions 
+                SET status = ?, detail = ?, pairing_code = ?, updated_at = datetime('now')
+                WHERE id = ?
+            `);
+            stmt.run(status, detail, pairingCode, sessionId);
+        } else {
+            const stmt = db.prepare(`
+                UPDATE whatsapp_sessions 
+                SET status = ?, detail = ?, updated_at = datetime('now')
+                WHERE id = ?
+            `);
+            stmt.run(status, detail, sessionId);
+        }
+        return this.findById(sessionId);
+    }
+
+    /**
+     * Update AI configuration for a session
+     * @param {string} sessionId - Session ID
+     * @param {object} aiConfig - AI configuration object
+     * @returns {object} Updated session
+     */
+    static updateAIConfig(sessionId, aiConfig) {
+        const { enabled, endpoint, key, model, prompt, mode, temperature, max_tokens } = aiConfig;
+        
+        // Handle undefined values to prevent overwriting existing ones with null if not provided
+        const existing = this.findById(sessionId);
+        if (!existing) return null;
+
         const stmt = db.prepare(`
             UPDATE whatsapp_sessions 
-            SET status = ?, detail = ?, updated_at = datetime('now')
+            SET ai_enabled = ?, ai_endpoint = ?, ai_key = ?, ai_model = ?, ai_prompt = ?, ai_mode = ?, 
+                ai_temperature = ?, ai_max_tokens = ?, updated_at = datetime('now')
             WHERE id = ?
         `);
-        stmt.run(status, detail, sessionId);
+        
+        stmt.run(
+            enabled !== undefined ? (enabled ? 1 : 0) : existing.ai_enabled, 
+            endpoint !== undefined ? endpoint : existing.ai_endpoint, 
+            key !== undefined ? key : existing.ai_key, 
+            model !== undefined ? model : existing.ai_model, 
+            prompt !== undefined ? prompt : existing.ai_prompt, 
+            mode !== undefined ? mode : (existing.ai_mode || 'bot'), 
+            temperature !== undefined ? temperature : (existing.ai_temperature ?? 0.7), 
+            max_tokens !== undefined ? max_tokens : (existing.ai_max_tokens ?? 1000), 
+            sessionId
+        );
         return this.findById(sessionId);
+    }
+
+    /**
+     * Update AI stats (increment counters)
+     * @param {string} sessionId - Session ID
+     * @param {string} type - 'received' or 'sent'
+     * @param {string} error - Optional error message
+     */
+    static updateAIStats(sessionId, type, error = null) {
+        if (type === 'received') {
+            const stmt = db.prepare(`
+                UPDATE whatsapp_sessions 
+                SET ai_messages_received = ai_messages_received + 1,
+                    ai_last_message_at = datetime('now'),
+                    updated_at = datetime('now')
+                WHERE id = ?
+            `);
+            stmt.run(sessionId);
+        } else if (type === 'sent') {
+            const stmt = db.prepare(`
+                UPDATE whatsapp_sessions 
+                SET ai_messages_sent = ai_messages_sent + 1,
+                    updated_at = datetime('now')
+                WHERE id = ?
+            `);
+            stmt.run(sessionId);
+        }
+
+        if (error) {
+            const stmt = db.prepare(`
+                UPDATE whatsapp_sessions 
+                SET ai_last_error = ?, updated_at = datetime('now')
+                WHERE id = ?
+            `);
+            stmt.run(error, sessionId);
+        }
     }
 
     /**
@@ -155,9 +246,14 @@ class Session {
         const entries = fs.readdirSync(SESSION_DIR, { withFileTypes: true });
         const directories = entries
             .filter(dirent => dirent.isDirectory())
-            .map(dirent => dirent.name);
+            .map(dirent => dirent.name)
+            .filter(name => {
+                // Ensure it's a valid session folder (contains creds.json)
+                const credsExists = fs.existsSync(path.join(SESSION_DIR, name, 'creds.json'));
+                return credsExists;
+            });
 
-        console.log(`[Session] Found ${directories.length} session folder(s) on disk: ${directories.join(', ')}`);
+        log(`[Session] Trouvé ${directories.length} dossier(s) de session valide(s) sur le disque`, 'SYSTEM', { count: directories.length }, 'INFO');
 
         const insertStmt = db.prepare(`
             INSERT OR IGNORE INTO whatsapp_sessions (id, owner_email, token, status, created_at, updated_at)
@@ -172,12 +268,12 @@ class Session {
                 const token = crypto.randomUUID();
                 insertStmt.run(sessionId, token);
                 addedCount++;
-                console.log(`[Session] Registered orphan session from disk: ${sessionId}`);
+                log(`[Session] Session orpheline enregistrée depuis le disque: ${sessionId}`, 'SYSTEM', { sessionId }, 'INFO');
             }
         }
 
         if (addedCount > 0) {
-            console.log(`[Session] Synced ${addedCount} sessions from disk to database`);
+            log(`[Session] Synchronisation de ${addedCount} sessions du disque vers la base de données`, 'SYSTEM', { count: addedCount }, 'INFO');
         }
     }
 }

@@ -16,11 +16,14 @@ RUN npm install
 # Copy application source
 COPY . .
 
+# Argument for API URL during build (important for Next.js)
+ARG NEXT_PUBLIC_API_URL
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+
 # Build the Next.js application
 RUN npm run build
 
-# Expose the frontend port (3001 or 3000, but Next default is 3000. 
-# We'll use 3001 if the backend uses 3000)
+# Expose the frontend port
 EXPOSE 3001
 
 # Start the application

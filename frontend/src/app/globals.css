@@ -1,6 +1,88 @@
 @import "tailwindcss";
 @import "tw-animate-css";
 @import "shadcn/tailwind.css";
+@import "intro.js/introjs.css";
+@import "nprogress/nprogress.css";
+
+/* NProgress Custom Styles */
+#nprogress .bar {
+  background: #10b981 !important; /* WhatsApp Green */
+  height: 3px !important;
+  box-shadow: 0 0 10px rgba(16, 185, 129, 0.5) !important;
+}
+
+#nprogress .peg {
+  box-shadow: 0 0 10px #10b981, 0 0 5px #10b981 !important;
+}
+
+#nprogress .spinner-icon {
+  border-top-color: #10b981 !important;
+  border-left-color: #10b981 !important;
+}
+
+/* Prism.js Terminal Overrides */
+code[class*="language-"],
+pre[class*="language-"] {
+  background: transparent !important;
+  padding: 0 !important;
+  margin: 0 !important;
+  font-size: 12px !important;
+  text-shadow: none !important;
+}
+
+.token.comment,
+.token.prolog,
+.token.doctype,
+.token.cdata {
+  color: #636e7b !important;
+}
+
+.token.punctuation {
+  color: #8b949e !important;
+}
+
+.token.property,
+.token.tag,
+.token.boolean,
+.token.number,
+.token.constant,
+.token.symbol {
+  color: #79c0ff !important;
+}
+
+.token.selector,
+.token.attr-name,
+.token.string,
+.token.char,
+.token.builtin,
+.token.inserted {
+  color: #a5d6ff !important;
+}
+
+.token.operator,
+.token.entity,
+.token.url,
+.language-css .token.string,
+.style .token.string {
+  color: #79c0ff !important;
+}
+
+.token.atrule,
+.token.attr-value,
+.token.keyword {
+  color: #ff7b72 !important;
+}
+
+.token.function,
+.token.class-name {
+  color: #d2a8ff !important;
+}
+
+.token.regex,
+.token.important,
+.token.variable {
+  color: #ffa657 !important;
+}
 
 @custom-variant dark (&:is(.dark *));
 
@@ -71,7 +153,7 @@
   --chart-3: oklch(0.627 0.194 149.214);
   --chart-4: oklch(0.527 0.154 150.069);
   --chart-5: oklch(0.448 0.119 151.328);
-  --radius: 0.625rem;
+  --radius: 0.5rem;
   --sidebar: oklch(0.985 0 0);
   --sidebar-foreground: oklch(0.145 0 0);
   --sidebar-primary: oklch(0.648 0.2 131.684);
@@ -122,5 +204,57 @@
   }
   body {
     @apply bg-background text-foreground;
+  }
+}
+
+@layer utilities {
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
+  }
+
+  /* Custom Modern Scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 10px;
+    transition: all 0.3s ease;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--muted-foreground);
+    opacity: 0.5;
+  }
+
+  .glass-card {
+    @apply bg-card/40 backdrop-blur-2xl border-2 border-primary/5 shadow-2xl;
+  }
+
+  .whappi-gradient {
+    @apply bg-gradient-to-br from-primary via-primary/80 to-primary/60;
+  }
+
+  .animate-float {
+    animation: float 6s ease-in-out infinite;
+  }
+
+  @keyframes float {
+    0%, 100% { transform: translateY(0); }
+    50% { transform: translateY(-10px); }
+  }
+
+  .nav-active-shadow {
+    box-shadow: 0 0 25px -5px var(--primary);
   }
 }

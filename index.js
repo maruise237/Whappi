@@ -22,37 +22,70 @@ const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
 const path = require('path');
+const fs = require('fs');
 const session = require('express-session');
 const FileStore = require('session-file-store')(session);
+const cookieParser = require('cookie-parser');
 const helmet = require('helmet');
 const rateLimit = require('express-rate-limit');
+const cors = require('cors');
+const { createClerkClient, ClerkExpressWithAuth } = require('@clerk/clerk-sdk-node');
 
 // Import new modules
 const { db } = require('./src/config/database');
-const { User, Session, ActivityLog } = require('./src/models');
+const { User, Session, ActivityLog, AIModel } = require('./src/models');
 const { encrypt, decrypt, isValidKey } = require('./src/utils/crypto');
 const response = require('./src/utils/response');
 const whatsappService = require('./src/services/whatsapp');
-const authRoutes = require('./src/routes/auth');
+const animatorService = require('./src/services/animator');
 const userRoutes = require('./src/routes/users');
+const webhookRoutes = require('./src/routes/webhooks');
+const { log, setBroadcastFn } = require('./src/utils/logger');
 const { errorHandler, notFoundHandler, asyncHandler } = require('./src/middleware/errorHandler');
 
-// API v1 (includes legacy endpoints)
+// API v1
 const { initializeApi } = require('./src/routes/api');
 
 // Validate encryption key
 const ENCRYPTION_KEY = process.env.TOKEN_ENCRYPTION_KEY;
 if (!ENCRYPTION_KEY || !isValidKey(ENCRYPTION_KEY)) {
-    console.error('FATAL: TOKEN_ENCRYPTION_KEY must be at least 64 hexadecimal characters!');
-    console.error('Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"');
+    log('FATAL: TOKEN_ENCRYPTION_KEY doit être au moins de 64 caractères hexadécimaux !', 'SYSTEM', { event: 'fatal-error' }, 'ERROR');
+    log('Générez-en une avec: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"', 'SYSTEM', { event: 'fatal-error-hint' }, 'ERROR');
     process.exit(1);
 }
 
 // Initialize Express
 const app = express();
 app.set('trust proxy', 1);
+
+// CORS configuration
+app.use(cors({
+    origin: (origin, callback) => {
+        // Allow requests with no origin (like mobile apps or curl)
+        if (!origin) return callback(null, true);
+        
+        const url = new URL(origin);
+        const hostname = url.hostname;
+
+        // Allow local development origins
+        if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname.startsWith('192.168.') || hostname.startsWith('10.')) {
+            return callback(null, true);
+        }
+        // Allow ngrok origins
+        if (hostname.includes('ngrok-free.app') || hostname.includes('ngrok.io')) {
+            return callback(null, true);
+        }
+        // In production or other cases, allow but warn or restrict if needed
+        callback(null, true);
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'ngrok-skip-browser-warning', 'x-requested-with']
+}));
+
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
+const clerkClient = createClerkClient({ secretKey: process.env.CLERK_SECRET_KEY });
 
 // WebSocket clients map
 const wsClients = new Map();
@@ -61,17 +94,43 @@ const wsClients = new Map();
 const isProduction = process.env.NODE_ENV === 'production';
 const sessionSecret = process.env.SESSION_SECRET || 'dev-secret-change-me';
 
-if (isProduction && !process.env.SESSION_SECRET) {
-    console.error('FATAL: SESSION_SECRET environment variable is required in production mode!');
-    process.exit(1);
+// Ensure sessions directory exists for FileStore
+const sessionsDir = path.join(__dirname, 'sessions');
+if (!fs.existsSync(sessionsDir)) {
+    fs.mkdirSync(sessionsDir, { recursive: true });
 }
 
-const sessionStore = new session.MemoryStore();
+const sessionStore = new FileStore({
+    path: './sessions',
+    logFn: (msg) => {
+        if (msg && !msg.includes('OK')) {
+            log(`[SessionStore] ${msg}`, 'SYSTEM', { event: 'session-store-warning', message: msg }, 'WARN');
+        }
+    },
+    retries: 10, // Increased retries for Windows stability
+    factor: 1.5,
+    minTimeout: 100,
+    maxTimeout: 1000,
+    fileExtension: '.json',
+    ttl: 86400,
+    reapInterval: 3600
+});
 
 // Middleware
+app.use(cookieParser());
+app.use(ClerkExpressWithAuth());
 app.use(express.json({ limit: '1mb' }));
 app.use(express.urlencoded({ extended: true }));
-app.use(express.static(path.join(__dirname)));
+
+// Dynamic session cookie security upgrade for HTTPS/ngrok (MUST BE BEFORE SESSION MIDDLEWARE)
+app.use((req, res, next) => {
+    const isProxySecure = req.headers['x-forwarded-proto'] === 'https' || req.secure;
+    if (isProxySecure) {
+        // Force secure and none for ngrok
+        req.app.set('trust proxy', 1); 
+    }
+    next();
+});
 
 app.use(helmet({
     contentSecurityPolicy: false,
@@ -92,21 +151,118 @@ app.use(session({
     secret: sessionSecret,
     resave: false,
     saveUninitialized: false,
+    rolling: true,
+    name: 'whatsapp_api_session',
+    proxy: true, 
     cookie: {
         httpOnly: true,
-        secure: process.env.COOKIE_SECURE === 'true', // Only use secure cookies if explicitly enabled or on HTTPS
-        sameSite: 'lax',
+        secure: 'auto', // Will be true if connection is secure
+        sameSite: 'lax', // Default, we will override for ngrok
         maxAge: 24 * 60 * 60 * 1000
     }
 }));
 
+// Dynamic session cookie adjustment for ngrok and IP access
+app.use((req, res, next) => {
+    const isProxySecure = req.headers['x-forwarded-proto'] === 'https' || req.secure;
+    const hostname = req.hostname;
+    
+    if (req.session && req.session.cookie) {
+        if (isProxySecure) {
+            // HTTPS (Ngrok) - Needs SameSite: None and Secure: True
+            req.session.cookie.secure = true;
+            req.session.cookie.sameSite = 'none';
+        } else if (hostname !== 'localhost' && hostname !== '127.0.0.1') {
+            // Local IP access (Phone) - Must be Secure: False and SameSite: Lax (or Default)
+            // because most mobile browsers block cookies on non-localhost HTTP if Secure: True
+            req.session.cookie.secure = false;
+            req.session.cookie.sameSite = 'lax';
+        }
+    }
+    next();
+});
+
+// WebSocket heartbeat
+const heartbeat = setInterval(() => {
+    wss.clients.forEach((ws) => {
+        if (ws.isAlive === false) return ws.terminate();
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 30000);
+
 // WebSocket handler
-wss.on('connection', (ws, req) => {
+wss.on('connection', async (ws, req) => {
+    ws.isAlive = true;
+    ws.on('pong', () => {
+        ws.isAlive = true;
+    });
+
     const url = new URL(req.url, `http://${req.headers.host}`);
     const wsToken = url.searchParams.get('token');
 
     let userInfo = null;
-    // TODO: Validate wsToken against session
+    if (wsToken) {
+        try {
+            // Check if it's a JWT (3 parts) or a session ID
+            let userId = null;
+            if (wsToken.split('.').length === 3) {
+                // It's a JWT
+                const decoded = await clerkClient.verifyToken(wsToken);
+                userId = decoded.sub;
+            } else {
+                // It's a session ID
+                const session = await clerkClient.sessions.verifySession(wsToken);
+                if (!session) {
+                    log('WebSocket session invalide', 'SYSTEM', null, 'WARN');
+                    ws.close(4001, 'Invalid session');
+                    return;
+                }
+                userId = session.userId;
+            }
+
+            if (!userId) {
+                log('WebSocket authentication failed: No user ID', 'SYSTEM', null, 'WARN');
+                ws.close(4001, 'Authentication failed');
+                return;
+            }
+
+            // Get user details
+            const clerkUser = await clerkClient.users.getUser(userId);
+            const email = clerkUser.emailAddresses[0]?.emailAddress;
+
+            // Auto-promote maruise237@gmail.com to admin
+            let targetRole = clerkUser.publicMetadata?.role || 'user';
+            if (email && email.toLowerCase() === 'maruise237@gmail.com') {
+                targetRole = 'admin';
+            }
+
+            // Get local user info for role
+            const localUser = User.findById(clerkUser.id) || User.findByEmail(email);
+            
+            userInfo = {
+                id: clerkUser.id,
+                email: email,
+                role: localUser?.role || targetRole
+            };
+            
+            log(`Client WebSocket connecté (Clerk): ${email}`, 'SYSTEM', { email, role: userInfo.role }, 'INFO');
+        } catch (err) {
+            log(`Échec de validation Clerk pour WebSocket: ${err.message}`, 'SYSTEM', null, 'ERROR');
+            
+            // Check if it's a token expiration error
+            if (err.message.includes('expired') || err.message.includes('Gone')) {
+                ws.close(4001, 'Token expired');
+            } else {
+                ws.close(4000, 'Invalid token');
+            }
+            return;
+        }
+    } else if (process.env.NODE_ENV === 'production') {
+        log('Connexion WebSocket refusée: Token manquant', 'SYSTEM', null, 'WARN');
+        ws.close(4000, 'Authentication required');
+        return;
+    }
 
     wsClients.set(ws, userInfo);
 
@@ -115,41 +271,31 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-// Broadcast to all WebSocket clients
+wss.on('close', () => {
+    clearInterval(heartbeat);
+});
+
+// Broadcast to WebSocket clients with role-based filtering
 function broadcastToClients(data) {
     const message = JSON.stringify(data);
-    for (const [client] of wsClients) {
+    for (const [client, userInfo] of wsClients) {
         if (client.readyState === 1) {
-            client.send(message);
+            // Role-based filtering: technical logs are only for admins
+            if (data.type === 'log') {
+                if (userInfo && userInfo.role === 'admin') {
+                    client.send(message);
+                }
+            } else {
+                // Other messages (like session updates) are sent to everyone
+                // (Optional: filter session updates based on ownership if needed)
+                client.send(message);
+            }
         }
     }
 }
 
-// Logger utility
-const log = (message, context, details, level) => {
-    // Determine level if not provided (heuristic)
-    if (!level) {
-        const lowerMsg = message.toLowerCase();
-        if (lowerMsg.includes('error') || lowerMsg.includes('fail')) level = 'ERROR';
-        else if (lowerMsg.includes('warn')) level = 'WARN';
-        else level = 'INFO';
-    }
-
-    const logObject = {
-        type: 'log',
-        timestamp: new Date().toISOString(),
-        sessionId: context || 'SYSTEM',
-        message: message,
-        level: level,
-        details: details || null
-    };
-
-    // Print to console
-    console.log(`[${logObject.timestamp}] [${logObject.level}] [${logObject.sessionId}] ${message}`, details || '');
-
-    // Broadcast to all connected dashboard clients
-    broadcastToClients(logObject);
-};
+// Initialize Logger
+setBroadcastFn(broadcastToClients);
 
 // User manager utility
 const userManager = {
@@ -163,23 +309,26 @@ const userManager = {
 const sessionTokens = new Map();
 
 // Helper to broadcast session updates
-const broadcastSessionUpdate = (id, status, detail, qr) => {
-    Session.updateStatus(id, status, detail);
+const broadcastSessionUpdate = (id, status, detail, qrOrCode) => {
+    const isPairingCode = status === 'GENERATING_CODE';
+    Session.updateStatus(id, status, detail, isPairingCode ? qrOrCode : null);
+    
     broadcastToClients({
         type: 'session-update',
         data: [{ 
             sessionId: id, 
             status, 
             detail, 
-            qr,
+            qr: status === 'GENERATING_QR' ? qrOrCode : null,
+            pairingCode: isPairingCode ? qrOrCode : null,
             token: Session.findById(id)?.token
         }]
     });
 };
 
-const createSessionWrapper = async (sessionId, email) => {
+const createSessionWrapper = async (sessionId, email, phoneNumber = null) => {
     const session = Session.create(sessionId, email);
-    await whatsappService.connect(sessionId, broadcastSessionUpdate, null);
+    await whatsappService.connect(sessionId, broadcastSessionUpdate, null, phoneNumber);
     
     if (session.token) {
         sessionTokens.set(sessionId, session.token);
@@ -188,9 +337,19 @@ const createSessionWrapper = async (sessionId, email) => {
 };
 
 const deleteSessionWrapper = async (sessionId) => {
-    whatsappService.deleteSessionData(sessionId);
+    // 1. Force disconnect and stop reconnection loops
+    whatsappService.disconnect(sessionId);
+    
+    // 2. Clear tokens
     sessionTokens.delete(sessionId);
+    
+    // 3. Delete metadata from Database
     Session.delete(sessionId);
+    
+    // 4. Delete physical files from disk (Important to prevent syncWithFilesystem from restoring it)
+    whatsappService.deleteSessionData(sessionId);
+    
+    // 5. Broadcast deletion to all clients
     broadcastToClients({
         type: 'session-deleted',
         data: { sessionId }
@@ -226,6 +385,18 @@ const getSessionsDetailsWrapper = (email, isAdmin) => {
 const triggerQRWrapper = async (sessionId) => {
     const session = Session.findById(sessionId);
     if (!session) return false;
+    
+    // Check if session is already connected
+    const activeSockets = whatsappService.getActiveSessions();
+    const hasSocket = activeSockets.has(sessionId);
+    const sock = hasSocket ? activeSockets.get(sessionId) : null;
+    const isConnected = hasSocket && sock?.user != null;
+
+    if (isConnected) {
+        log(`La session ${sessionId} est déjà connectée, reconnexion ignorée`, 'SYSTEM', { sessionId }, 'INFO');
+        broadcastSessionUpdate(sessionId, 'CONNECTED', 'Déjà connecté');
+        return true;
+    }
     
     whatsappService.connect(sessionId, broadcastSessionUpdate, null);
     return true;
@@ -292,16 +463,47 @@ const apiRouter = initializeApi(
     triggerQRWrapper
 );
 
-// Mount new routes
-app.use('/admin', authRoutes);
+// Mount routes
+app.use('/webhooks', webhookRoutes);
 app.use('/admin/users', userRoutes);
 
-// Compatibility route for legacy dashboard
-app.get('/admin/activities', (req, res) => {
-    res.redirect('/api/v1/activities');
-});
-
 app.use('/api/v1', apiRouter);
+
+// Serve modern UI
+const frontendPath = path.join(__dirname, 'frontend', 'out');
+
+if (fs.existsSync(frontendPath)) {
+    // 1. Serve _next/static explicitly with long-term caching
+    // Fix: Map /_next/static to frontend/out/_next/static
+    app.use('/_next/static', express.static(path.join(frontendPath, '_next', 'static'), {
+        maxAge: '1y',
+        immutable: true,
+        fallthrough: false // Fail if not found to avoid falling back to index.html for assets
+    }));
+
+    // 2. Serve other static files
+    app.use(express.static(frontendPath, {
+        extensions: ['html'],
+        index: 'index.html'
+    }));
+
+    // 3. Fallback to index.html for SPA routing
+    app.get('*', (req, res, next) => {
+        // Skip for API routes
+        if (req.path.startsWith('/api') || req.path.startsWith('/admin')) {
+            return next();
+        }
+        res.sendFile(path.join(frontendPath, 'index.html'));
+    });
+} else {
+    app.get('/', (req, res) => {
+        res.status(200).json({ 
+            status: 'online', 
+            message: 'Whappi API Server is running.',
+            frontend: 'Not found in /frontend/out. Please build it with "npm run build".'
+        });
+    });
+}
 
 // Error handlers
 app.use(notFoundHandler);
@@ -310,13 +512,16 @@ app.use(errorHandler);
 // Ensure default admin exists
 User.ensureAdmin(process.env.ADMIN_DASHBOARD_PASSWORD);
 
+// Ensure default AI model exists
+AIModel.ensureDefaultDeepSeek();
+
 // Initialize existing sessions on startup
 (async () => {
     // Sync sessions from disk to DB
     Session.syncWithFilesystem();
 
     const existingSessions = Session.getAll();
-    console.log(`[SYSTEM] Found ${existingSessions.length} existing session(s)`);
+    log(`Trouvé ${existingSessions.length} session(s) existante(s)`, 'SYSTEM', { count: existingSessions.length }, 'INFO');
 
     for (const session of existingSessions) {
         // Populate sessionTokens
@@ -327,26 +532,29 @@ User.ensureAdmin(process.env.ADMIN_DASHBOARD_PASSWORD);
         // Re-initialize any session that was previously connected, disconnected, or stuck in connecting/generating QR
         const statusesToReinit = ['CONNECTED', 'DISCONNECTED', 'CONNECTING', 'INITIALIZING', 'GENERATING_QR'];
         if (statusesToReinit.includes(session.status)) {
-            console.log(`[SYSTEM] Re-initializing session: ${session.id} (last status: ${session.status})`);
+            log(`Réinitialisation de la session: ${session.id} (dernier statut: ${session.status})`, 'SYSTEM', { sessionId: session.id, status: session.status }, 'INFO');
 
             // Reset status to DISCONNECTED briefly to ensure a clean slate for Baileys
-            Session.updateStatus(session.id, 'DISCONNECTED', 'Restarting...');
+            Session.updateStatus(session.id, 'DISCONNECTED', 'Redémarrage...');
 
             whatsappService.connect(session.id, broadcastSessionUpdate, null);
         }
     }
+
+    // Start animator service
+    animatorService.start();
 })();
 
 // Start server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () => {
-    console.log(`[SYSTEM] Server is running on port ${PORT}`);
-    console.log(`[SYSTEM] Admin dashboard: http://localhost:${PORT}/admin/dashboard.html`);
+    log(`Serveur en cours d'exécution sur le port ${PORT}`, 'SYSTEM', { port: PORT }, 'INFO');
+    log(`Tableau de bord: http://localhost:${PORT}`, 'SYSTEM', { url: `http://localhost:${PORT}` }, 'INFO');
 });
 
 // Graceful shutdown
 process.on('SIGINT', () => {
-    console.log('\n[SYSTEM] Shutting down...');
+    log('Arrêt en cours...', 'SYSTEM', null, 'INFO');
 
     // Disconnect all WhatsApp sessions
     for (const [sessionId] of whatsappService.getActiveSessions()) {
@@ -354,7 +562,7 @@ process.on('SIGINT', () => {
     }
 
     server.close(() => {
-        console.log('[SYSTEM] Server closed');
+        log('Serveur arrêté', 'SYSTEM', null, 'INFO');
         process.exit(0);
     });
 });

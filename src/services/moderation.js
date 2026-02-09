@@ -1,0 +1,491 @@
+const { db } = require('../config/database');
+const { jidNormalizedUser } = require('@whiskeysockets/baileys');
+const { Session, ActivityLog } = require('../models');
+const { log } = require('../utils/logger');
+const aiService = require('./ai');
+
+/**
+ * Moderation Service
+ * Handles group moderation logic (Anti-spam, Anti-link, Bad words)
+ */
+
+// Helper to check if a user is admin
+function isGroupAdmin(groupMetadata, myJid, myLid, sessionId) {
+    if (!groupMetadata.participants) {
+        log(`Pas de liste de participants pour le groupe ${groupMetadata.id || groupMetadata.subject}`, sessionId, { 
+            event: 'moderation-debug-no-participants',
+            groupId: groupMetadata.id,
+            subject: groupMetadata.subject
+        }, 'DEBUG');
+        return false;
+    }
+    
+    const normalizedTarget = jidNormalizedUser(myJid);
+    const normalizedLid = myLid ? jidNormalizedUser(myLid) : null;
+
+    const participant = groupMetadata.participants.find(p => {
+        const pId = jidNormalizedUser(p.id);
+        return pId === normalizedTarget || (normalizedLid && pId === normalizedLid);
+    });
+    
+    if (!participant) {
+        return false;
+    }
+    
+    // Baileys roles: 'admin' (admin), 'superadmin' (créateur), null (membre)
+    const isAdmin = participant.admin === 'admin' || participant.admin === 'superadmin';
+    
+    if (isAdmin) {
+        log(`Admin détecté pour le groupe ${groupMetadata.subject} (${groupMetadata.id})`, sessionId, {
+            event: 'moderation-debug-admin-found',
+            role: participant.admin,
+            matchedId: participant.id,
+            myJid: normalizedTarget,
+            myLid: normalizedLid
+        }, 'DEBUG');
+    }
+    
+    return !!isAdmin;
+}
+
+/**
+ * Get all groups where the session is an admin
+ * @param {object} sock - Baileys socket instance
+ * @param {string} sessionId - Session ID
+ * @returns {Promise<Array>} List of admin groups
+ */
+async function getAdminGroups(sock, sessionId) {
+    try {
+        if (!sock) {
+            log(`Échec de récupération des groupes: Socket inexistant pour ${sessionId}`, sessionId, { event: 'moderation-error-no-sock' }, 'ERROR');
+            throw new Error('Socket non initialisé');
+        }
+
+        if (!sock.user) {
+            const wsState = sock.ws?.readyState;
+            const stateNames = ['CONNECTING', 'OPEN', 'CLOSING', 'CLOSED'];
+            const stateName = wsState !== undefined ? stateNames[wsState] : 'UNKNOWN';
+            
+            log(`Échec de récupération des groupes: Socket non authentifié pour ${sessionId}`, sessionId, { 
+                event: 'moderation-error-not-authed',
+                sockState: wsState,
+                sockStateName: stateName
+            }, 'ERROR');
+            throw new Error(`WhatsApp non connecté (Statut: ${stateName})`);
+        }
+
+        log(`Récupération des groupes pour la session ${sessionId}...`, sessionId, { event: 'moderation-fetch-start' }, 'DEBUG');
+        
+        // Use a timeout for group fetching to prevent hanging
+        const groups = await Promise.race([
+            sock.groupFetchAllParticipating(),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout groupFetchAllParticipating')), 15000))
+        ]);
+
+        const myJid = jidNormalizedUser(sock.user.id);
+        const myLid = sock.user.lid || sock.user.LID;
+        log(`Mon JID: ${myJid}, Mon LID: ${myLid || 'Non défini'}`, sessionId, { 
+            event: 'moderation-debug-ids',
+            userObj: { id: sock.user.id, lid: sock.user.lid, name: sock.user.name }
+        }, 'DEBUG');
+        
+        const allGroupsCount = Object.keys(groups || {}).length;
+        log(`${allGroupsCount} groupes au total trouvés pour ${sessionId}`, sessionId, { event: 'moderation-groups-total', count: allGroupsCount }, 'DEBUG');
+        
+        const adminGroups = [];
+        const allGroups = Object.values(groups || {});
+        
+        if (allGroups.length > 0) {
+            // Find a group where I am present (any role) to check JID or LID matching
+            const anyGroupWithMe = allGroups.find(g => g.participants?.some(p => {
+                const pId = jidNormalizedUser(p.id);
+                return pId === myJid || (myLid && pId === jidNormalizedUser(myLid));
+            }));
+            if (anyGroupWithMe) {
+                const meInGroup = anyGroupWithMe.participants.find(p => {
+                    const pId = jidNormalizedUser(p.id);
+                    return pId === myJid || (myLid && pId === jidNormalizedUser(myLid));
+                });
+                log(`Trouvé dans le groupe "${anyGroupWithMe.subject}": Rôle=${meInGroup.admin || 'membre'}`, sessionId, { 
+                    event: 'moderation-debug-me',
+                    group: anyGroupWithMe.subject,
+                    role: meInGroup.admin,
+                    myJidInGroup: meInGroup.id,
+                    myJidNormalized: myJid,
+                    myLidNormalized: myLid ? jidNormalizedUser(myLid) : null
+                }, 'DEBUG');
+            } else {
+                log(`ALERTE: Mon JID (${myJid}) ou LID (${myLid || 'N/A'}) n'a été trouvé dans AUCUN des ${allGroups.length} groupes !`, sessionId, { 
+                    event: 'moderation-debug-notfound',
+                    myJid: myJid,
+                    myLid: myLid,
+                    firstGroupParticipants: allGroups[0].participants?.slice(0, 5).map(p => p.id)
+                }, 'WARN');
+            }
+        }
+        
+        if (allGroups.length === 0) {
+            log(`Aucun groupe trouvé pour la session ${sessionId}`, sessionId, { event: 'moderation-no-groups' }, 'INFO');
+            return [];
+        }
+
+        for (const [id, metadata] of Object.entries(groups)) {
+            let currentMetadata = metadata;
+            
+            // Si les participants manquent, essayer de récupérer les métadonnées fraîches
+            if (!currentMetadata.participants || currentMetadata.participants.length === 0) {
+                try {
+                    log(`Métadonnées incomplètes pour ${id}, récupération forcée...`, sessionId, { event: 'moderation-fetch-metadata', groupId: id }, 'DEBUG');
+                    currentMetadata = await sock.groupMetadata(id);
+                } catch (metaErr) {
+                    log(`Impossible de récupérer les métadonnées pour ${id}: ${metaErr.message}`, sessionId, { event: 'moderation-fetch-metadata-error', groupId: id }, 'WARN');
+                }
+            }
+
+            const isAdmin = isGroupAdmin(currentMetadata, myJid, myLid, sessionId);
+            
+            if (isAdmin) {
+                // Get settings if they exist
+                const settings = db.prepare('SELECT * FROM group_settings WHERE group_id = ? AND session_id = ?').get(id, sessionId);
+                
+                adminGroups.push({
+                    id,
+                    subject: currentMetadata.subject,
+                    creation: currentMetadata.creation,
+                    desc: currentMetadata.desc,
+                    participantsCount: currentMetadata.participants?.length || 0,
+                    settings: settings || {
+                        is_active: 0,
+                        anti_link: 0,
+                        bad_words: '',
+                        warning_template: 'Attention @{{name}}, avertissement {{count}}/{{max}} pour : {{reason}}.',
+                        max_warnings: 5
+                    }
+                });
+            }
+        }
+        
+        log(`${adminGroups.length} groupes administrés trouvés pour ${sessionId}`, sessionId, { 
+            event: 'moderation-fetch-success', 
+            count: adminGroups.length 
+        }, 'INFO');
+
+        return adminGroups;
+    } catch (error) {
+        log(`Erreur lors de la récupération des groupes pour ${sessionId}: ${error.message}`, sessionId, { 
+            event: 'moderation-fetch-error', 
+            error: error.message,
+            stack: error.stack 
+        }, 'ERROR');
+        throw error;
+    }
+}
+
+/**
+ * Update group moderation settings
+ * @param {string} sessionId 
+ * @param {string} groupId 
+ * @param {object} settings 
+ */
+function updateGroupSettings(sessionId, groupId, settings) {
+    const { is_active, anti_link, bad_words, warning_template, max_warnings, welcome_enabled, welcome_template } = settings;
+    
+    log(`Mise à jour des paramètres de modération pour le groupe ${groupId}`, sessionId, { 
+        event: 'moderation-config-update',
+        settings: { is_active, anti_link, bad_words, max_warnings, welcome_enabled, ai_assistant_enabled: settings.ai_assistant_enabled }
+    }, 'INFO');
+
+    const stmt = db.prepare(`
+        INSERT INTO group_settings (group_id, session_id, is_active, anti_link, bad_words, warning_template, max_warnings, welcome_enabled, welcome_template, ai_assistant_enabled, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(group_id, session_id) DO UPDATE SET
+        is_active = excluded.is_active,
+        anti_link = excluded.anti_link,
+        bad_words = excluded.bad_words,
+        warning_template = excluded.warning_template,
+        max_warnings = excluded.max_warnings,
+        welcome_enabled = excluded.welcome_enabled,
+        welcome_template = excluded.welcome_template,
+        ai_assistant_enabled = excluded.ai_assistant_enabled,
+        updated_at = CURRENT_TIMESTAMP
+    `);
+    
+    stmt.run(groupId, sessionId, is_active ? 1 : 0, anti_link ? 1 : 0, bad_words, warning_template, max_warnings, welcome_enabled ? 1 : 0, welcome_template, settings.ai_assistant_enabled ? 1 : 0);
+}
+
+/**
+ * Handle participant updates (welcome messages)
+ * @param {object} sock 
+ * @param {string} sessionId 
+ * @param {object} update 
+ */
+async function handleParticipantUpdate(sock, sessionId, update) {
+    const { id: groupId, participants, action } = update;
+    
+    if (action !== 'add') return;
+    
+    try {
+        const settings = db.prepare('SELECT * FROM group_settings WHERE group_id = ? AND session_id = ?').get(groupId, sessionId);
+        
+        if (!settings || !settings.welcome_enabled || !settings.welcome_template) {
+            return;
+        }
+
+        const groupMetadata = await sock.groupMetadata(groupId);
+        const groupService = require('./groups');
+        const profile = groupService.getProfile(sessionId, groupId);
+        const links = groupService.getProductLinks(sessionId, groupId);
+
+        for (const jid of participants) {
+            let message = settings.welcome_template;
+            
+            // Basic variables
+            message = message
+                .replace(/{{name}}/g, `@${jid.split('@')[0]}`)
+                .replace(/{{group_name}}/g, groupMetadata.subject)
+                .replace(/{{date}}/g, new Date().toLocaleDateString('fr-FR'))
+                .replace(/{{rules}}/g, profile?.rules || groupMetadata.desc || 'Pas de règles spécifiées.');
+
+            // Product links integration
+            if (links.length > 0) {
+                let linksText = "\n\n*Nos produits/liens :*\n";
+                links.forEach(link => {
+                    linksText += `\n📌 *${link.title}*\n${link.description}\n🔗 ${link.url}\n👉 ${link.cta}\n`;
+                });
+                message += linksText;
+            }
+
+            await sock.sendMessage(groupId, { 
+                text: aiService.formatForWhatsApp(message),
+                mentions: [jid]
+            });
+            
+            // Log activity
+            const session = Session.findById(sessionId);
+            if (ActivityLog && session) {
+                await ActivityLog.logMessageSend(
+                    session.owner_email || 'moderation-system',
+                    sessionId,
+                    groupId,
+                    'text',
+                    '127.0.0.1',
+                    'Moderation (Welcome)'
+                );
+            }
+            // Update stats
+            Session.updateAIStats(sessionId, 'sent');
+            
+            log(`[Bienvenue] Message envoyé à ${jid} dans ${groupId}`, sessionId, { event: 'moderation-welcome-sent' }, 'INFO');
+        }
+    } catch (err) {
+        log(`Erreur lors de l'envoi du message de bienvenue: ${err.message}`, sessionId, { event: 'moderation-welcome-error', error: err.message }, 'ERROR');
+    }
+}
+
+/**
+ * Handle incoming message for moderation
+ * @param {object} sock 
+ * @param {string} sessionId 
+ * @param {object} msg 
+ * @returns {Promise<boolean>} True if message was handled/blocked
+ */
+async function handleIncomingMessage(sock, sessionId, msg) {
+    // Only handle group messages
+    if (!msg.key.remoteJid.endsWith('@g.us')) return false;
+    
+    const groupId = msg.key.remoteJid;
+    const senderJid = jidNormalizedUser(msg.key.participant || msg.participant || msg.key.remoteJid);
+    
+    // 1. Get Settings
+    const settings = db.prepare('SELECT * FROM group_settings WHERE group_id = ? AND session_id = ?').get(groupId, sessionId);
+    
+    // 2. Check for AI Assistant (Section 2.6) - Can run even if moderation is inactive
+    // We do this BEFORE moderation if it's a question, or AFTER if it's not a violation
+    const text = msg.message?.conversation || 
+                msg.message?.extendedTextMessage?.text || 
+                msg.message?.imageMessage?.caption || 
+                msg.message?.videoMessage?.caption || "";
+
+    const isQuestion = text.includes('?') || /comment|pourquoi|quand|quel|quelle|où|est-ce que|aide|info|besoin/i.test(text);
+    
+    if (settings && settings.ai_assistant_enabled && isQuestion) {
+        log(`[Modération] Assistant IA activé pour le groupe ${groupId} (Question détectée)`, sessionId, { event: 'ai-assistant-trigger' }, 'DEBUG');
+        const aiService = require('./ai');
+        // We run this as a separate task to not block moderation if active
+        // isGroupMode = true for handleIncomingMessage
+        aiService.handleIncomingMessage(sock, sessionId, msg, true).catch(err => {
+            log(`Erreur Assistant IA Groupe: ${err.message}`, sessionId, { groupId }, 'ERROR');
+        });
+        
+        // Return true to indicate we've "handled" it if we want to stop here, 
+        // but usually we still want to run moderation (anti-link etc)
+        // so we don't return true yet.
+    }
+
+    // 3. Moderation Logic
+    if (!settings || !settings.is_active) {
+        return false;
+    }
+
+    log(`[Modération] Vérification pour ${senderJid} dans ${groupId}`, sessionId, { event: 'moderation-check' }, 'INFO');
+
+    // Check if sender is admin (admins are immune)
+    try {
+        const myJid = jidNormalizedUser(sock.user.id);
+        const myLid = sock.user.lid || sock.user.LID;
+
+        const groupMetadata = await sock.groupMetadata(groupId);
+        if (isGroupAdmin(groupMetadata, senderJid, null, sessionId)) {
+            log(`[Modération] ${senderJid} est admin, immunisé.`, sessionId, { event: 'moderation-skip-admin' }, 'DEBUG');
+            return false; // Admins are immune
+        }
+        
+        // Content Analysis
+        const text = msg.message?.conversation || 
+                    msg.message?.extendedTextMessage?.text || 
+                    msg.message?.imageMessage?.caption || 
+                    msg.message?.videoMessage?.caption || "";
+                    
+        if (!text) return false;
+        
+        let violation = null;
+        
+        // 1. Anti-Link Check
+        if (settings.anti_link) {
+            const linkRegex = /(https?:\/\/[^\s]+)|(www\.[^\s]+)|(chat\.whatsapp\.com\/[^\s]+)/gi;
+            if (linkRegex.test(text)) {
+                violation = 'Lien non autorisé';
+            }
+        }
+        
+        // 2. Bad Words Check
+        if (!violation && settings.bad_words) {
+            const badWords = settings.bad_words.split(',').map(w => w.trim().toLowerCase()).filter(w => w);
+            const lowerText = text.toLowerCase();
+            if (badWords.some(word => lowerText.includes(word))) {
+                violation = 'Langage inapproprié';
+            }
+        }
+        
+        if (violation) {
+            log(`Violation détectée dans ${groupId} par ${senderJid}: ${violation}`, sessionId, {
+                event: 'moderation-violation',
+                groupId,
+                senderJid,
+                violation
+            }, 'WARN');
+            
+            // Check if BOT is admin before trying to delete/kick
+            const botIsAdmin = isGroupAdmin(groupMetadata, myJid, myLid, sessionId);
+            
+            if (!botIsAdmin) {
+                log(`[Modération] Violation détectée mais le bot n'est pas admin dans ${groupId}. Action impossible.`, sessionId, { event: 'moderation-no-admin-privilege' }, 'WARN');
+                return false;
+            }
+            
+            // 1. Delete Message
+            await sock.sendMessage(groupId, { delete: msg.key });
+            
+            // 2. Increment Warnings
+            // Note: session_id est requis pour la PK et la contrainte
+            const warningInfo = db.prepare(`
+                INSERT INTO user_warnings (group_id, session_id, user_id, count, last_warning_at)
+                VALUES (?, ?, ?, 1, CURRENT_TIMESTAMP)
+                ON CONFLICT(group_id, session_id, user_id) DO UPDATE SET
+                count = count + 1,
+                last_warning_at = CURRENT_TIMESTAMP
+                RETURNING count
+            `).get(groupId, sessionId, senderJid);
+            
+            const currentCount = warningInfo.count;
+            const maxWarnings = settings.max_warnings || 5;
+            
+            // 3. Kick if max reached
+            if (currentCount >= maxWarnings) {
+                log(`User ${senderJid} kicked from ${groupId} after ${currentCount} warnings`, sessionId, {
+                    event: 'moderation-kick',
+                    groupId,
+                    senderJid,
+                    warnings: currentCount
+                }, 'ERROR');
+                await sock.groupParticipantsUpdate(groupId, [senderJid], 'remove');
+                await sock.sendMessage(groupId, { 
+                    text: `@${senderJid.split('@')[0]} a été exclu après ${currentCount} avertissements.`,
+                    mentions: [senderJid]
+                });
+
+                // Log activity
+                const session = Session.findById(sessionId);
+                if (ActivityLog && session) {
+                    await ActivityLog.logMessageSend(
+                        session.owner_email || 'moderation-system',
+                        sessionId,
+                        groupId,
+                        'text',
+                        '127.0.0.1',
+                        'Moderation (Kick)'
+                    );
+                }
+                // Update stats
+                Session.updateAIStats(sessionId, 'sent');
+            } else {
+                // 4. Send Warning
+                let template = settings.warning_template || 'Attention @{{name}}, avertissement {{count}}/{{max}} pour : {{reason}}.';
+                
+                // Replace variables
+                // Note: We don't have the user's display name easily without fetching it, so we use the number or @mention
+            const warningMsg = template
+                .replace(/{{name}}/g, `@${senderJid.split('@')[0]}`)
+                .replace(/{{count}}/g, currentCount)
+                .replace(/{{max}}/g, maxWarnings)
+                .replace(/{{reason}}/g, violation);
+            
+            // Fix double @ if template already has it
+            const cleanWarningMsg = warningMsg.replace(/@@/g, '@');
+            
+            await sock.sendMessage(groupId, { 
+                text: aiService.formatForWhatsApp(cleanWarningMsg),
+                mentions: [senderJid]
+            });
+
+            // Log activity
+            const session = Session.findById(sessionId);
+            if (ActivityLog && session) {
+                await ActivityLog.logMessageSend(
+                    session.owner_email || 'moderation-system',
+                    sessionId,
+                    groupId,
+                    'text',
+                    '127.0.0.1',
+                    'Moderation (Warning)'
+                );
+            }
+            // Update stats
+            Session.updateAIStats(sessionId, 'sent');
+            }
+            
+            return true; // Message handled
+        }
+        
+    } catch (err) {
+        log(`Error processing message for moderation: ${err.message}`, sessionId, {
+            event: 'moderation-error',
+            error: err.message
+        }, 'ERROR');
+        // Log error to session stats if possible
+        try {
+            Session.updateAIStats(sessionId, 'error', `Moderation Error: ${err.message}`);
+        } catch (logErr) {
+            // Ignore logging errors
+        }
+    }
+    
+    return false;
+}
+
+module.exports = {
+    getAdminGroups,
+    updateGroupSettings,
+    handleIncomingMessage,
+    handleParticipantUpdate
+};

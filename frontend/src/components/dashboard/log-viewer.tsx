@@ -6,13 +6,18 @@ import {
   Trash2, 
   Search, 
   Play, 
-  Square
+  Square,
+  Info,
+  ChevronDown,
+  ChevronUp,
+  Maximize2
 } from "lucide-react"
 
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import { Badge } from "@/components/ui/badge"
 import {
   Select,
   SelectContent,
@@ -20,12 +25,22 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select"
-import { useWebSocket } from "@/hooks/use-websocket"
+import { useWebSocket } from "@/providers/websocket-provider"
+import { cn } from "@/lib/utils"
+import Prism from "prismjs"
+import "prismjs/components/prism-json"
+import "prismjs/themes/prism-tomorrow.css"
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip"
 
 interface LogEntry {
   type: string;
   level: string;
-  message: string;
+  message: any;
   sessionId: string;
   [key: string]: any;
 }
@@ -35,9 +50,17 @@ export function LogViewer() {
   const [logs, setLogs] = React.useState<LogEntry[]>([])
   const [search, setSearch] = React.useState("")
   const [levelFilter, setLevelFilter] = React.useState("all")
+  const [expandedLogs, setExpandedLogs] = React.useState<Record<number, boolean>>({})
   const scrollRef = React.useRef<HTMLDivElement>(null)
   
   const { lastMessage } = useWebSocket()
+
+  const toggleExpand = (index: number) => {
+    setExpandedLogs(prev => ({
+      ...prev,
+      [index]: !prev[index]
+    }))
+  }
 
   // Handle new logs from WebSocket
   React.useEffect(() => {
@@ -57,102 +80,248 @@ export function LogViewer() {
   }, [logs, isAutoScroll])
 
   const filteredLogs = logs.filter(log => {
-    const matchesSearch = log.message.toLowerCase().includes(search.toLowerCase()) || 
-                         log.sessionId.toLowerCase().includes(search.toLowerCase())
+    const logMsg = typeof log.message === 'string' ? log.message : JSON.stringify(log.message)
+    const matchesSearch = logMsg.toLowerCase().includes(search.toLowerCase()) || 
+                         (log.sessionId && log.sessionId.toLowerCase().includes(search.toLowerCase()))
     const matchesLevel = levelFilter === "all" || log.level.toLowerCase() === levelFilter.toLowerCase()
     return matchesSearch && matchesLevel
   })
 
   const clearLogs = () => setLogs([])
 
+  const formatMessage = (message: any, index: number) => {
+    try {
+      const isExpanded = expandedLogs[index]
+      
+      if (typeof message === 'object') {
+        const formatted = JSON.stringify(message, null, 2)
+        const isLong = formatted.length > 300
+        const displayContent = isLong && !isExpanded ? formatted.substring(0, 300) + '...' : formatted
+
+        return (
+          <div className="relative group/msg">
+            <pre className={cn(
+              "mt-1 p-2 sm:p-3 rounded-lg bg-black/50 overflow-x-auto border border-white/5 font-mono text-[9px] sm:text-[10px]",
+              !isExpanded && isLong && "max-h-[80px] sm:max-h-[100px] overflow-hidden"
+            )}>
+              <code 
+                className="language-json"
+                dangerouslySetInnerHTML={{ 
+                  __html: Prism.highlight(displayContent, Prism.languages.json, 'json') 
+                }}
+              />
+            </pre>
+            {isLong && (
+              <Button 
+                variant="ghost" 
+                size="sm" 
+                onClick={() => toggleExpand(index)}
+                className="mt-1.5 h-7 px-2.5 text-[8px] sm:text-[9px] font-black uppercase tracking-widest bg-primary/10 hover:bg-primary/20 text-primary border border-primary/20 rounded-lg flex items-center gap-1.5 active:scale-95 transition-transform"
+              >
+                {isExpanded ? (
+                  <>RÉDUIRE <ChevronUp className="w-3 h-3" /></>
+                ) : (
+                  <>VOIR TOUT ({Math.round(formatted.length / 1024)} KB) <ChevronDown className="w-3 h-3" /></>
+                )}
+              </Button>
+            )}
+          </div>
+        )
+      }
+
+      // Try to parse as JSON to see if it's a JSON string
+      if (typeof message === 'string' && (message.startsWith('{') || message.startsWith('['))) {
+        try {
+          const parsed = JSON.parse(message)
+          const formatted = JSON.stringify(parsed, null, 2)
+          const isLong = formatted.length > 300
+          const displayContent = isLong && !isExpanded ? formatted.substring(0, 300) + '...' : formatted
+
+          return (
+            <div className="relative group/msg">
+              <pre className={cn(
+              "mt-1 p-2 sm:p-3 rounded-lg bg-black/50 overflow-x-auto border border-white/5 font-mono text-[9px] sm:text-[10px]",
+              !isExpanded && isLong && "max-h-[80px] sm:max-h-[100px] overflow-hidden"
+            )}>
+                <code 
+                  className="language-json"
+                  dangerouslySetInnerHTML={{ 
+                    __html: Prism.highlight(displayContent, Prism.languages.json, 'json') 
+                  }}
+                />
+              </pre>
+              {isLong && (
+                <Button 
+                  variant="ghost" 
+                  size="sm" 
+                  onClick={() => toggleExpand(index)}
+                  className="mt-1.5 h-7 px-2.5 text-[8px] sm:text-[9px] font-black uppercase tracking-widest bg-primary/10 hover:bg-primary/20 text-primary border border-primary/20 rounded-lg flex items-center gap-1.5 active:scale-95 transition-transform"
+                >
+                  {isExpanded ? (
+                    <>RÉDUIRE <ChevronUp className="w-3 h-3" /></>
+                  ) : (
+                    <>VOIR TOUT ({Math.round(formatted.length / 1024)} KB) <ChevronDown className="w-3 h-3" /></>
+                  )}
+                </Button>
+              )}
+            </div>
+          )
+        } catch (e) { /* Fallback to string handling */ }
+      }
+      
+      const textMessage = String(message)
+      const isLongText = textMessage.length > 300
+      const displayText = isLongText && !isExpanded ? textMessage.substring(0, 300) + '...' : textMessage
+
+      return (
+        <div className="flex flex-col gap-1.5">
+          <span className="text-slate-300 break-words whitespace-pre-wrap font-mono text-[10px] sm:text-[11px] leading-relaxed">
+            {displayText}
+          </span>
+          {isLongText && (
+            <Button 
+              variant="ghost" 
+              size="sm" 
+              onClick={() => toggleExpand(index)}
+              className="w-fit h-7 px-2.5 text-[8px] sm:text-[9px] font-black uppercase tracking-widest bg-primary/10 hover:bg-primary/20 text-primary border border-primary/20 rounded-lg flex items-center gap-1.5 active:scale-95 transition-transform"
+            >
+              {isExpanded ? (
+                <>RÉDUIRE <ChevronUp className="w-3 h-3" /></>
+              ) : (
+                <>VOIR TOUT <ChevronDown className="w-3 h-3" /></>
+              )}
+            </Button>
+          )}
+        </div>
+      )
+    } catch (e) {
+      return <span className="text-slate-300 break-all text-[10px] sm:text-[11px]">{String(message)}</span>
+    }
+  }
+
   return (
-    <Card className="border-2 border-primary/10 overflow-hidden bg-[#0f172a] text-slate-200">
-      <CardHeader className="bg-slate-900/50 border-b border-slate-800 pb-3">
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-          <div className="flex items-center gap-2">
-            <Terminal className="w-5 h-5 text-primary" />
-            <CardTitle className="text-lg font-bold text-white">System Logs</CardTitle>
+    <Card className="border-2 border-primary/10 overflow-hidden bg-[#0a0a0b] text-slate-300 log-viewer shadow-2xl shadow-black/50 rounded-lg w-full">
+      <CardHeader className="bg-[#121214] border-b border-white/5 p-4 sm:p-6">
+        <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 sm:gap-6">
+          <div className="flex items-center gap-3 sm:gap-4">
+            <div className="p-2.5 sm:p-3 rounded-lg bg-primary/10 text-primary border border-primary/20 shadow-inner shrink-0">
+              <Terminal className="w-5 h-5 sm:w-6 sm:h-6" />
+            </div>
+            <div className="space-y-1 min-w-0">
+              <div className="flex items-center gap-2 sm:gap-3 flex-wrap">
+                <CardTitle className="text-base sm:text-xl font-black uppercase tracking-tight bg-gradient-to-r from-primary to-primary/60 bg-clip-text text-transparent truncate">Logs Live</CardTitle>
+                <Badge variant="outline" className="bg-primary/5 text-primary border-primary/20 font-mono text-[8px] sm:text-[10px] font-black px-1.5 sm:px-2 py-0.5 rounded-lg shadow-sm">
+                  {logs.length}
+                </Badge>
+                <Tooltip>
+                  <TooltipTrigger asChild>
+                    <Info className="w-3.5 h-3.5 sm:w-4 sm:h-4 text-slate-500 cursor-help hover:text-primary transition-colors duration-200 hidden sm:block" />
+                  </TooltipTrigger>
+                  <TooltipContent className="bg-[#1a1a1c]/95 backdrop-blur-xl border-2 border-primary/20 p-3 shadow-2xl rounded-lg">
+                    <div className="p-2 font-sans">
+                      <strong className="text-primary">Débogage et Présence</strong><br/>
+                      <span className="text-[11px] opacity-80">Affiche les événements internes de l'API Baileys. Les logs de Presence indiquent si la session est vue comme "en ligne" par WhatsApp.</span>
+                    </div>
+                  </TooltipContent>
+                </Tooltip>
+              </div>
+              <div className="flex items-center gap-2">
+                <div className="w-1.5 h-1.5 sm:w-2 sm:h-2 rounded-full bg-emerald-500 animate-pulse shadow-[0_0_8px_rgba(16,185,129,0.5)]" />
+                <span className="text-[8px] sm:text-[10px] font-black uppercase tracking-[0.2em] text-emerald-500/80">Flux actif</span>
+              </div>
+            </div>
           </div>
           
-          <div className="flex flex-wrap items-center gap-2">
-            <div className="relative flex-1 md:w-64">
-              <Search className="absolute left-2.5 top-2.5 h-4 w-4 text-slate-500" />
+          <div className="flex flex-col sm:flex-row items-center gap-3 sm:gap-4 flex-1">
+            <div className="relative w-full sm:flex-1 group">
+              <Search className="absolute left-4 top-1/2 -translate-y-1/2 h-3.5 w-3.5 sm:h-4 sm:w-4 text-slate-500 group-focus-within:text-primary transition-colors duration-200" />
               <Input 
-                placeholder="Search logs..." 
-                className="pl-9 bg-slate-950 border-slate-800 text-slate-200 placeholder:text-slate-600 h-9" 
+                placeholder="RECHERCHER..." 
+                className="pl-11 sm:pl-12 bg-[#1a1a1c] border-white/5 text-slate-200 placeholder:text-slate-600 h-11 sm:h-14 rounded-lg focus-visible:ring-primary/30 w-full font-black text-[9px] sm:text-[10px] uppercase tracking-widest transition-all duration-200 focus:bg-[#1f1f22] focus:border-primary/20 shadow-inner" 
                 value={search}
                 onChange={(e) => setSearch(e.target.value)}
               />
             </div>
             
-            <Select value={levelFilter} onValueChange={setLevelFilter}>
-              <SelectTrigger className="w-[110px] bg-slate-950 border-slate-800 h-9">
-                <SelectValue placeholder="Level" />
-              </SelectTrigger>
-              <SelectContent className="bg-slate-950 border-slate-800 text-slate-200">
-                <SelectItem value="all">All Levels</SelectItem>
-                <SelectItem value="info">Info</SelectItem>
-                <SelectItem value="warn">Warning</SelectItem>
-                <SelectItem value="error">Error</SelectItem>
-                <SelectItem value="debug">Debug</SelectItem>
-              </SelectContent>
-            </Select>
+            <div className="flex items-center gap-2 sm:gap-3 w-full sm:w-auto">
+              <Select value={levelFilter} onValueChange={setLevelFilter}>
+                <SelectTrigger className="flex-1 sm:w-[130px] lg:w-[160px] bg-[#1a1a1c] border-white/5 h-11 sm:h-14 rounded-lg text-[9px] sm:text-[10px] font-black uppercase tracking-widest focus:ring-primary/30 transition-all duration-200 px-3 sm:px-4 shadow-inner">
+                  <SelectValue placeholder="NIVEAU" />
+                </SelectTrigger>
+                <SelectContent className="bg-[#1a1a1c] border-white/10 text-slate-200 rounded-lg shadow-2xl backdrop-blur-xl">
+                  <SelectItem value="all" className="font-black text-[9px] sm:text-[10px] uppercase tracking-widest focus:bg-primary/10">Tous les niveaux</SelectItem>
+                  <SelectItem value="info" className="text-blue-400 font-black text-[9px] sm:text-[10px] uppercase tracking-widest focus:bg-blue-400/10">Info</SelectItem>
+                  <SelectItem value="warn" className="text-amber-400 font-black text-[9px] sm:text-[10px] uppercase tracking-widest focus:bg-amber-400/10">Attention</SelectItem>
+                  <SelectItem value="error" className="text-rose-400 font-black text-[9px] sm:text-[10px] uppercase tracking-widest focus:bg-rose-400/10">Erreur</SelectItem>
+                  <SelectItem value="debug" className="text-purple-400 font-black text-[9px] sm:text-[10px] uppercase tracking-widest focus:bg-purple-400/10">Debug</SelectItem>
+                </SelectContent>
+              </Select>
 
-            <div className="flex items-center gap-1 border border-slate-800 rounded-md p-0.5 bg-slate-950">
-              <Button 
-                variant="ghost" 
-                size="icon" 
-                className={`h-8 w-8 ${isAutoScroll ? 'text-primary bg-primary/10' : 'text-slate-500'}`}
-                onClick={() => setIsAutoScroll(!isAutoScroll)}
-                title={isAutoScroll ? "Disable Auto-scroll" : "Enable Auto-scroll"}
-              >
-                {isAutoScroll ? <Play className="h-4 w-4 fill-current" /> : <Square className="h-4 w-4 fill-current" />}
-              </Button>
-              <Button 
-                variant="ghost" 
-                size="icon" 
-                className="h-8 w-8 text-slate-500 hover:text-red-400"
-                onClick={clearLogs}
-                title="Clear Logs"
-              >
-                <Trash2 className="h-4 w-4" />
-              </Button>
+              <div className="flex items-center gap-2 bg-[#1a1a1c] p-1 sm:p-2 rounded-lg border border-white/5 sm:w-auto justify-center sm:justify-start shadow-inner shrink-0">
+                <Button 
+                  variant="ghost" 
+                  size="icon" 
+                  className={cn(
+                    "h-9 w-9 sm:h-10 sm:w-10 rounded-lg transition-all duration-200 active:scale-95",
+                    isAutoScroll ? "bg-primary text-primary-foreground shadow-lg shadow-primary/20" : "text-slate-500 hover:text-slate-300 hover:bg-white/5"
+                  )}
+                  onClick={() => setIsAutoScroll(!isAutoScroll)}
+                >
+                  {isAutoScroll ? <Square className="w-3.5 h-3.5 sm:w-4 sm:h-4 fill-current" /> : <Play className="w-3.5 h-3.5 sm:w-4 sm:h-4 fill-current" />}
+                </Button>
+                <Button 
+                  variant="ghost" 
+                  size="icon" 
+                  className="h-9 w-9 sm:h-10 sm:w-10 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-400/10 transition-all duration-200 active:scale-95"
+                  onClick={clearLogs}
+                >
+                  <Trash2 className="w-3.5 h-3.5 sm:w-4 sm:h-4" />
+                </Button>
+              </div>
             </div>
           </div>
         </div>
       </CardHeader>
+      
       <CardContent className="p-0">
-        <ScrollArea ref={scrollRef} className="h-[450px] w-full font-mono text-[13px] leading-relaxed">
-          <div className="p-4 space-y-1">
+        <ScrollArea ref={scrollRef} className="h-[350px] sm:h-[450px] w-full bg-[#0a0a0b] font-mono">
+          <div className="p-3 sm:p-6 space-y-1.5 sm:space-y-2">
             {filteredLogs.length === 0 ? (
-              <div className="text-slate-600 text-center py-8 italic">
-                {logs.length === 0 ? "Waiting for logs..." : "No logs match your filters."}
+              <div className="flex flex-col items-center justify-center h-[300px] sm:h-[350px] text-slate-600 space-y-4">
+                <div className="p-5 sm:p-6 rounded-lg bg-white/[0.02] border border-white/5">
+                  <Terminal className="w-10 h-10 sm:w-12 sm:h-12 opacity-10" />
+                </div>
+                <p className="text-[9px] sm:text-[11px] font-black uppercase tracking-[0.3em] opacity-30 italic px-4 text-center">Flux de logs en attente d'activité...</p>
               </div>
             ) : (
               filteredLogs.map((log, i) => (
-                <div key={i} className={`flex gap-3 hover:bg-white/5 px-2 py-0.5 rounded transition-colors group ${log.level === 'ERROR' ? 'border-l-2 border-red-500/50' : ''}`}>
-                  <span className="text-slate-500 shrink-0">
-                    {new Date(log.timestamp).toLocaleTimeString([], { hour12: false })}
-                  </span>
-                  <span className={`font-bold shrink-0 w-12 text-center rounded text-[10px] uppercase h-5 flex items-center justify-center mt-0.5 ${
-                    log.level === 'INFO' ? 'text-emerald-400 bg-emerald-400/10' :
-                    log.level === 'WARN' ? 'text-amber-400 bg-amber-400/10' :
-                    log.level === 'ERROR' ? 'text-red-400 bg-red-400/10' :
-                    'text-slate-400 bg-slate-400/10'
-                  }`}>
-                    {log.level}
-                  </span>
-                  <span className="text-sky-400 font-semibold shrink-0 cursor-pointer hover:underline truncate max-w-[80px]">
-                    {log.sessionId}
-                  </span>
-                  <span className="text-slate-300 break-all">
-                    {typeof log.message === 'object' ? JSON.stringify(log.message) : log.message}
-                    {log.details && (
-                      <span className="ml-2 text-slate-500 text-[11px] italic">
-                        {typeof log.details === 'object' ? JSON.stringify(log.details) : log.details}
+                <div key={i} className="group flex items-start gap-2.5 sm:gap-4 text-[9px] sm:text-[11px] leading-relaxed py-1.5 sm:py-2 px-2 sm:px-4 rounded-lg hover:bg-white/[0.03] transition-all duration-200 border-l-2 sm:border-l-4 border-transparent hover:border-primary/50 overflow-hidden">
+                  <span className="text-slate-600 shrink-0 select-none min-w-[30px] sm:min-w-[40px] font-mono opacity-50 text-[8px] sm:text-[10px] mt-0.5">{String(i + 1).padStart(3, '0')}</span>
+                  
+                  <div className="flex flex-col gap-1.5 flex-1 min-w-0">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-slate-500 shrink-0 font-bold select-none opacity-80 whitespace-nowrap">
+                        [{new Date().toLocaleTimeString([], { hour12: false })}]
                       </span>
-                    )}
-                  </span>
+                      <span className={cn(
+                        "font-black uppercase px-1.5 py-0.5 rounded-md text-[7px] sm:text-[9px] tracking-widest shrink-0 min-w-[50px] sm:min-w-[60px] text-center shadow-sm",
+                        log.level === 'info' && "bg-blue-500/10 text-blue-400 border border-blue-500/20",
+                        log.level === 'warn' && "bg-amber-500/10 text-amber-400 border border-amber-500/20",
+                        log.level === 'error' && "bg-rose-500/10 text-rose-400 border border-rose-500/20",
+                        log.level === 'debug' && "bg-purple-500/10 text-purple-400 border border-purple-500/20"
+                      )}>
+                        {log.level}
+                      </span>
+                      {log.sessionId && (
+                        <span className="text-primary font-black uppercase tracking-tighter shrink-0 px-1.5 py-0.5 bg-primary/5 rounded-md border border-primary/10 text-[7px] sm:text-[9px]">
+                          {log.sessionId}
+                        </span>
+                      )}
+                    </div>
+                    <div className="min-w-0">
+                      {formatMessage(log.message, i)}
+                    </div>
+                  </div>
                 </div>
               ))
             )}

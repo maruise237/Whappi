@@ -4,6 +4,7 @@
  */
 
 const response = require('../utils/response');
+const { log } = require('../utils/logger');
 
 /**
  * Error handler middleware
@@ -11,12 +12,12 @@ const response = require('../utils/response');
  */
 function errorHandler(err, req, res, next) {
     // Log the error
-    console.error('[Error]', {
+    log(`[Error] ${err.message}`, 'SYSTEM', {
         message: err.message,
         stack: process.env.NODE_ENV === 'development' ? err.stack : undefined,
         path: req.path,
         method: req.method
-    });
+    }, 'ERROR');
 
     // If headers already sent, don't try to send another response
     if (res.headersSent) {

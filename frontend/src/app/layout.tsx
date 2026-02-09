@@ -1,13 +1,17 @@
 import type { Metadata } from "next";
 import { Inter } from "next/font/google";
+import { ClerkProvider } from "@clerk/nextjs";
+import { frFR } from "@clerk/localizations";
 import "./globals.css";
 import { Toaster } from "@/components/ui/sonner";
+import ProgressBar from "@/components/progress-bar";
+import { Suspense } from "react";
 
 const inter = Inter({ subsets: ["latin"], variable: "--font-inter" });
 
 export const metadata: Metadata = {
-  title: "Whappi | WhatsApp Gateway",
-  description: "Ultra-light WhatsApp API Gateway",
+  title: "Whappi | Passerelle WhatsApp",
+  description: "Passerelle API WhatsApp ultra-légère",
 };
 
 export default function RootLayout({
@@ -16,7 +20,7 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en" suppressHydrationWarning>
+    <html lang="fr" suppressHydrationWarning>
       <head>
         <script
           dangerouslySetInnerHTML={{
@@ -33,8 +37,13 @@ export default function RootLayout({
         />
       </head>
       <body className={`${inter.className} antialiased`} suppressHydrationWarning>
-        {children}
-        <Toaster />
+        <ClerkProvider localization={frFR}>
+          <Suspense fallback={null}>
+            <ProgressBar />
+          </Suspense>
+          {children}
+          <Toaster />
+        </ClerkProvider>
       </body>
     </html>
   );

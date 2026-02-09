@@ -3,6 +3,7 @@ const path = require('path');
 const sanitizeHtml = require('sanitize-html');
 const { encrypt, decrypt } = require('../utils/crypto');
 const { isValidId } = require('../utils/validation');
+const { log } = require('../utils/logger');
 
 class RecipientListManager {
     constructor(encryptionKey) {
@@ -31,7 +32,7 @@ class RecipientListManager {
         try {
             return JSON.parse(decrypted);
         } catch (e) {
-            console.error('Failed to parse decrypted list data:', e);
+            log(`Échec de l'analyse des données de liste déchiffrées: ${e.message}`, 'RECIPIENT_LIST', { error: e.message }, 'ERROR');
             return null;
         }
     }
@@ -54,7 +55,7 @@ class RecipientListManager {
     // Load recipient list from file
     loadList(listId) {
         if (!require('../utils/validation').isValidId(listId)) {
-            console.error('Invalid list ID:', listId);
+            log(`ID de liste invalide: ${listId}`, 'RECIPIENT_LIST', { listId }, 'ERROR');
             return null;
         }
         try {
@@ -66,7 +67,7 @@ class RecipientListManager {
             const encrypted = fs.readFileSync(filePath, 'utf-8');
             return this.decrypt(encrypted);
         } catch (error) {
-            console.error('Error loading recipient list:', error);
+            log(`Erreur lors du chargement de la liste de destinataires: ${error.message}`, 'RECIPIENT_LIST', { listId, error: error.message }, 'ERROR');
             return null;
         }
     }
@@ -102,7 +103,7 @@ class RecipientListManager {
                 return bDate - aDate;
             });
         } catch (error) {
-            console.error('Error getting recipient lists:', error);
+            log(`Erreur lors de la récupération des listes de destinataires: ${error.message}`, 'RECIPIENT_LIST', { error: error.message }, 'ERROR');
             return [];
         }
     }
@@ -160,7 +161,7 @@ class RecipientListManager {
             }
             return true;
         } catch (error) {
-            console.error('Error deleting recipient list:', error);
+            log(`Erreur lors de la suppression de la liste de destinataires: ${error.message}`, 'RECIPIENT_LIST', { listId, error: error.message }, 'ERROR');
             return false;
         }
     }

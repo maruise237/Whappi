@@ -1,4 +1,8 @@
 const EventEmitter = require('events');
+const { jidNormalizedUser } = require('@whiskeysockets/baileys');
+const { normalizeJid } = require('../utils/phone');
+const fs = require('fs');
+const { log } = require('../utils/logger');
 
 class CampaignSender extends EventEmitter {
     constructor(campaignManager, sessions, activityLogger) {
@@ -12,10 +16,10 @@ class CampaignSender extends EventEmitter {
 
     // Start sending a campaign
     async startCampaign(campaignId, userEmail) {
-        console.log(`[CampaignSender] Loading campaign ${campaignId} for ${userEmail}`);
+        log(`Loading campaign ${campaignId} for ${userEmail}`, 'SYSTEM', { campaignId, userEmail });
         const campaign = this.campaignManager.loadCampaign(campaignId);
         if (!campaign) {
-            console.error(`[CampaignSender] Failed to load campaign ${campaignId}. File may be missing or decryption failed.`);
+            log(`Failed to load campaign ${campaignId}. File may be missing or decryption failed.`, 'SYSTEM', { campaignId }, 'ERROR');
             throw new Error('Campaign not found or could not be loaded');
         }
 
@@ -26,27 +30,22 @@ class CampaignSender extends EventEmitter {
 
         // Check if session exists and is connected
         const session = this.sessions.get(campaign.sessionId);
-        console.log(`🔍 Session check for ${campaign.sessionId}:`, {
-            sessionId: campaign.sessionId,
-            sessionExists: !!session,
-            sessionStatus: session?.status,
-            hasSock: !!session?.sock,
-            sockType: session?.sock ? typeof session.sock : 'undefined',
-            availableSessions: typeof this.sessions.keys === 'function' ?
-                Array.from(this.sessions.keys()) :
-                (this.sessions.getActiveSessions ? Array.from(this.sessions.getActiveSessions().keys()) : 'N/A')
-        });
-
+        
         if (!session || session.status !== 'CONNECTED' || !session.sock) {
-            console.error(`Session validation failed for ${campaign.sessionId}:`, {
-                exists: !!session,
-                status: session?.status,
-                hasSock: !!session?.sock
-            });
+            log(`Session validation failed for ${campaign.sessionId}`, campaign.sessionId, {
+                event: 'campaign-start-fail',
+                campaignId,
+                status: session?.status
+            }, 'ERROR');
             throw new Error(`WhatsApp session '${campaign.sessionId}' is not connected or not available`);
         }
 
-        console.log(`🚀 Starting campaign: ${campaign.name} (${campaign.recipients.length} recipients)`);
+        log(`Starting campaign: ${campaign.name} (${campaign.recipients.length} recipients)`, campaign.sessionId, {
+            event: 'campaign-start',
+            campaignId,
+            campaignName: campaign.name,
+            recipientsCount: campaign.recipients.length
+        }, 'INFO');
 
         // Initialize queue
         const queue = {
@@ -93,14 +92,17 @@ class CampaignSender extends EventEmitter {
         }
 
         const session = this.sessions.get(campaign.sessionId);
-        console.log(`🔍 Session check in processQueue for ${campaign.sessionId}:`, {
+        log(`Vérification de la session pour ${campaign.sessionId} dans processQueue`, campaign.sessionId, {
             sessionExists: !!session,
             sessionStatus: session?.status,
             hasSock: !!session?.sock
-        });
+        }, 'DEBUG');
 
         if (!session || session.status !== 'CONNECTED' || !session.sock) {
-            console.error(`Session ${campaign.sessionId} not available or not connected`);
+            log(`Session ${campaign.sessionId} not available or not connected`, campaign.sessionId, {
+                event: 'campaign-batch-fail',
+                campaignId
+            }, 'ERROR');
             this.pauseCampaign(campaignId, 'Session disconnected or not available');
             return;
         }
@@ -108,15 +110,11 @@ class CampaignSender extends EventEmitter {
         // Get next batch of recipients
         const pendingRecipients = this.campaignManager.getPendingRecipients(campaignId, 1);
 
-        console.log(`📋 Pending recipients check:`, {
-            campaignId: campaignId,
-            pendingRecipientsCount: pendingRecipients.length,
-            totalRecipients: campaign.recipients.length,
-            recipientStatuses: campaign.recipients.map(r => ({ number: r.number, status: r.status }))
-        });
-
         if (pendingRecipients.length === 0) {
-            console.log(`⚠️ No pending recipients found, completing campaign`);
+            log(`Campaign ${campaign.name} completed`, campaign.sessionId, {
+                event: 'campaign-complete',
+                campaignId
+            }, 'INFO');
             // Campaign completed
             this.completeCampaign(campaignId);
             return;
@@ -139,7 +137,26 @@ class CampaignSender extends EventEmitter {
 
             // Prepare message based on type
             let messageData;
-            const jid = recipient.number.includes('@') ? recipient.number : `${recipient.number}@s.whatsapp.net`;
+            const jid = normalizeJid(recipient.number);
+
+            // Function to get media payload (buffer for local files, url object for remote)
+            const getMediaPayload = (mediaUrl) => {
+                if (!mediaUrl) return null;
+                
+                // Check if it's a local file path
+                if (mediaUrl.startsWith('/') || mediaUrl.includes(':\\') || mediaUrl.includes(':/')) {
+                    try {
+                        if (fs.existsSync(mediaUrl)) {
+                            return fs.readFileSync(mediaUrl);
+                        }
+                    } catch (e) {
+                        log(`Échec de la lecture du fichier média local: ${mediaUrl}`, campaign.sessionId, { error: e.message }, 'WARN');
+                    }
+                }
+                
+                // Default to URL object
+                return { url: mediaUrl };
+            };
 
             switch (campaign.message.type) {
                 case 'text':
@@ -150,7 +167,7 @@ class CampaignSender extends EventEmitter {
 
                 case 'image':
                     messageData = {
-                        image: { url: campaign.message.mediaUrl },
+                        image: getMediaPayload(campaign.message.mediaUrl),
                         caption: campaign.message.mediaCaption ?
                             this.campaignManager.processTemplate(campaign.message.mediaCaption, recipient) :
                             messageContent
@@ -159,7 +176,7 @@ class CampaignSender extends EventEmitter {
 
                 case 'document':
                     messageData = {
-                        document: { url: campaign.message.mediaUrl },
+                        document: getMediaPayload(campaign.message.mediaUrl),
                         fileName: campaign.message.fileName || 'document.pdf',
                         caption: campaign.message.mediaCaption ?
                             this.campaignManager.processTemplate(campaign.message.mediaCaption, recipient) :
@@ -169,7 +186,7 @@ class CampaignSender extends EventEmitter {
 
                 case 'audio':
                     messageData = {
-                        audio: { url: campaign.message.mediaUrl },
+                        audio: getMediaPayload(campaign.message.mediaUrl),
                         mimetype: campaign.message.mimetype || 'audio/mp4',
                         ptt: campaign.message.ptt || false
                     };
@@ -177,7 +194,7 @@ class CampaignSender extends EventEmitter {
 
                 case 'video':
                     messageData = {
-                        video: { url: campaign.message.mediaUrl },
+                        video: getMediaPayload(campaign.message.mediaUrl),
                         caption: campaign.message.mediaCaption ?
                             this.campaignManager.processTemplate(campaign.message.mediaCaption, recipient) :
                             messageContent,
@@ -190,12 +207,12 @@ class CampaignSender extends EventEmitter {
             }
 
             // Send message using the correct property name (sock instead of socket)
-            console.log(`📤 Sending message to ${recipient.number} (${recipient.name || 'Unknown'}) at ${new Date().toISOString()}`);
-            console.log(`Message details:`, {
-                jid: jid,
-                messageType: campaign.message.type,
-                contentLength: messageContent.length
-            });
+            log(`Sending message to ${recipient.number} (${recipient.name || 'Unknown'})`, campaign.sessionId, {
+                event: 'campaign-message-sending',
+                campaignId,
+                recipient: recipient.number,
+                messageType: campaign.message.type
+            }, 'INFO');
 
             await session.sock.sendMessage(jid, messageData);
 
@@ -231,10 +248,19 @@ class CampaignSender extends EventEmitter {
                 'sent'
             );
 
-            console.log(`✅ Message sent successfully to ${recipient.number}`);
+            log(`Message sent successfully to ${recipient.number}`, campaign.sessionId, {
+                event: 'campaign-message-sent',
+                campaignId,
+                recipient: recipient.number
+            }, 'INFO');
 
         } catch (error) {
-            console.error(`❌ Error sending to ${recipient.number}:`, error.message);
+            log(`Error sending to ${recipient.number}: ${error.message}`, campaign.sessionId, {
+                event: 'campaign-message-fail',
+                campaignId,
+                recipient: recipient.number,
+                error: error.message
+            }, 'ERROR');
 
             // Update recipient status with error
             this.campaignManager.updateRecipientStatus(
@@ -270,9 +296,7 @@ class CampaignSender extends EventEmitter {
         // Schedule next message
         if (queue.status === 'running') {
             const delay = campaign.settings.delayBetweenMessages || 3000;
-            console.log(`⏳ Waiting ${delay}ms (${delay / 1000} seconds) before next message at ${new Date().toISOString()}`);
             setTimeout(() => {
-                console.log(`⏰ Delay complete, processing next message at ${new Date().toISOString()}`);
                 this.processQueue(campaignId);
             }, delay);
         }
@@ -312,15 +336,14 @@ class CampaignSender extends EventEmitter {
         // Check if session exists and is connected
         const session = this.sessions.get(campaign.sessionId);
         if (!session || session.status !== 'CONNECTED' || !session.sock) {
-            console.error(`Session validation failed for resuming ${campaign.sessionId}:`, {
-                exists: !!session,
-                status: session?.status,
-                hasSock: !!session?.sock
-            });
-            throw new Error(`WhatsApp session '${campaign.sessionId}' is not connected or not available`);
+            log(`Échec de la validation de la session pour la reprise de ${campaign.sessionId}`, campaign.sessionId, {
+                campaignId,
+                status: session?.status
+            }, 'ERROR');
+            throw new Error(`WhatsApp session '${campaign.sessionId}' is not connected`);
         }
 
-        console.log(`▶️ Resuming campaign: ${campaign.name}`);
+        log(`Reprise de la campagne: ${campaign.name}`, campaign.sessionId, { campaignId, campaignName: campaign.name }, 'INFO');
 
         if (!queue) {
             // Re-create queue if it doesn't exist

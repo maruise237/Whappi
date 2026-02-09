@@ -3,6 +3,8 @@
  * Ensures consistent response format across all endpoints
  */
 
+const { log } = require('./logger');
+
 /**
  * Send a success response
  * @param {object} res - Express response object
@@ -77,7 +79,7 @@ function notFound(res, message = 'Not found') {
  */
 function serverError(res, message = 'Internal server error', err = null) {
     if (err) {
-        console.error('[Server Error]', err);
+        log(`[Server Error] ${message}: ${err.message}`, 'SYSTEM', { error: err.message, stack: err.stack }, 'ERROR');
     }
     return error(res, message, 500);
 }

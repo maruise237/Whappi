@@ -1,36 +1,50 @@
 /**
  * User Model
- * SQLite-based user management with bcrypt password hashing
+ * SQLite-based user management synced with Clerk
  */
 
 const { db } = require('../config/database');
 const bcrypt = require('../utils/bcrypt-compat');
+const { log } = require('../utils/logger');
 const crypto = require('crypto');
 
 class User {
     /**
-     * Create a new user
+     * Create or Update a user from Clerk
      * @param {object} userData - User data
-     * @returns {object} Created user (without password)
+     * @returns {object} Created/Updated user
      */
-    static async create({ email, password, role = 'user', createdBy = null }) {
-        const existingUser = this.findByEmail(email);
+    static async create({ id, email, name = null, role = 'user', imageUrl = null, createdBy = null }) {
+        const existingUser = this.findById(id) || this.findByEmail(email);
+        
+        // Auto-promote maruise237@gmail.com to admin
+        const targetRole = email.toLowerCase() === 'maruise237@gmail.com' ? 'admin' : role;
+        
         if (existingUser) {
-            throw new Error('User already exists');
+            // Update existing user if needed (e.g. name, role or image change)
+            const stmt = db.prepare(`
+                UPDATE users 
+                SET email = ?, name = ?, role = ?, image_url = ?
+                WHERE id = ?
+            `);
+            stmt.run(email.toLowerCase(), name, targetRole || existingUser.role, imageUrl, existingUser.id);
+            return this.findById(existingUser.id);
         }
 
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const id = crypto.randomUUID();
         const normalizedEmail = email.toLowerCase();
-
+        const userId = id || crypto.randomUUID();
+        
         const stmt = db.prepare(`
-            INSERT INTO users (id, email, password, role, created_by, created_at, is_active)
-            VALUES (?, ?, ?, ?, ?, datetime('now'), 1)
+            INSERT INTO users (
+                id, email, name, password, role, image_url, created_by, created_at, 
+                is_active, is_verified
+            )
+            VALUES (?, ?, ?, 'CLERK_EXTERNAL_AUTH', ?, ?, ?, datetime('now'), 1, 1)
         `);
 
-        stmt.run(id, normalizedEmail, hashedPassword, role, createdBy);
+        stmt.run(userId, normalizedEmail, name, targetRole, imageUrl, createdBy);
 
-        return this.findById(id);
+        return this.findById(userId);
     }
 
     /**
@@ -39,45 +53,61 @@ class User {
      * @returns {object|null} User object or null
      */
     static findById(id) {
+        if (!id) return null;
+        
         const stmt = db.prepare('SELECT * FROM users WHERE id = ?');
         const user = stmt.get(id);
+        
+        if (!user && id === 'legacy-admin') {
+            const adminUser = this.findByEmail('admin@localhost');
+            return adminUser ? this._sanitize(adminUser) : null;
+        }
+
         return user ? this._sanitize(user) : null;
     }
 
     /**
      * Find user by email
      * @param {string} email - User email
-     * @returns {object|null} User object (with password for auth) or null
+     * @returns {object|null} User object or null
      */
     static findByEmail(email) {
+        if (!email) return null;
         const stmt = db.prepare('SELECT * FROM users WHERE email = ?');
-        return stmt.get(email?.toLowerCase());
+        return stmt.get(email.toLowerCase());
     }
 
     /**
-     * Authenticate user
-     * @param {string} email - User email
-     * @param {string} password - User password
-     * @returns {object|null} User object or null if invalid
+     * Update AI configuration for a user
+     * @param {string} id - User ID
+     * @param {object} aiConfig - AI configuration object
+     * @returns {object} Updated user
      */
-    static async authenticate(email, password) {
-        const user = this.findByEmail(email);
-        if (!user || !user.is_active) {
-            return null;
-        }
-
-        const isValid = await bcrypt.compare(password, user.password);
-        if (!isValid) {
-            return null;
-        }
-
-        // Update last login
-        const updateStmt = db.prepare(`
-            UPDATE users SET last_login = datetime('now') WHERE id = ?
+    static updateAIConfig(id, aiConfig) {
+        const { enabled, prompt, model } = aiConfig;
+        const stmt = db.prepare(`
+            UPDATE users 
+            SET ai_enabled = ?, ai_prompt = ?, ai_model = ?
+            WHERE id = ?
         `);
-        updateStmt.run(user.id);
+        stmt.run(enabled ? 1 : 0, prompt, model, id);
+        return this.findById(id);
+    }
 
-        return this._sanitize(user);
+    /**
+     * Update WhatsApp status
+     * @param {string} id - User ID
+     * @param {string} status - New status
+     * @param {string} number - WhatsApp number
+     */
+    static updateWhatsAppStatus(id, status, number = null) {
+        const stmt = db.prepare(`
+            UPDATE users 
+            SET whatsapp_status = ?, whatsapp_number = ?
+            WHERE id = ?
+        `);
+        stmt.run(status, number, id);
+        return this.findById(id);
     }
 
     /**
@@ -88,27 +118,18 @@ class User {
      */
     static async update(id, updates) {
         const user = this.findById(id);
-        if (!user) {
-            throw new Error('User not found');
-        }
+        if (!user) throw new Error('User not found');
 
-        // Don't allow updating certain fields
+        // Don't allow updating certain fields through this method
         delete updates.id;
-        delete updates.email;
+        delete updates.password; // Clerk handles passwords
         delete updates.created_by;
         delete updates.created_at;
 
-        // Hash password if being updated
-        if (updates.password) {
-            updates.password = await bcrypt.hash(updates.password, 10);
-        }
-
-        const allowedFields = ['password', 'role', 'is_active'];
+        const allowedFields = ['email', 'name', 'role', 'is_active', 'bio', 'location', 'website', 'phone'];
         const fieldsToUpdate = Object.keys(updates).filter(k => allowedFields.includes(k));
 
-        if (fieldsToUpdate.length === 0) {
-            return user;
-        }
+        if (fieldsToUpdate.length === 0) return user;
 
         const setClause = fieldsToUpdate.map(f => `${f} = ?`).join(', ');
         const values = fieldsToUpdate.map(f => updates[f]);
@@ -151,21 +172,24 @@ class User {
     }
 
     /**
-     * Create default admin user if none exists
+     * Create default admin user if none exists (Legacy support)
      * @param {string} adminPassword - Admin password from environment
      */
     static async ensureAdmin(adminPassword) {
         if (!adminPassword) return;
 
-        const adminExists = this.findByEmail('admin@localhost');
-        if (!adminExists) {
-            await this.create({
-                email: 'admin@localhost',
-                password: adminPassword,
-                role: 'admin',
-                createdBy: 'system'
-            });
-            console.log('[User] Default admin user created');
+        const adminEmail = 'admin@localhost';
+        const adminUser = this.findByEmail(adminEmail);
+
+        if (!adminUser) {
+            const hashedPassword = await bcrypt.hash(adminPassword, 10);
+            const id = 'legacy-admin-id';
+            const stmt = db.prepare(`
+                INSERT INTO users (id, email, name, password, role, created_by, created_at, is_active, is_verified)
+                VALUES (?, ?, 'Legacy Admin', ?, 'admin', 'system', datetime('now'), 1, 1)
+            `);
+            stmt.run(id, adminEmail, hashedPassword);
+            log('Utilisateur admin par défaut créé (Legacy)', 'AUTH', { email: adminEmail }, 'INFO');
         }
     }
 }

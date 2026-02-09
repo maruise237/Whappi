@@ -17,6 +17,7 @@ const pino = require('pino');
 const path = require('path');
 const fs = require('fs');
 const QRCode = require('qrcode');
+const { log } = require('../utils/logger');
 
 // Logger configuration
 const defaultLogLevel = process.env.NODE_ENV === 'production' ? 'silent' : 'warn';
@@ -43,12 +44,16 @@ function ensureAuthDir() {
  * @param {string} sessionId - Session ID
  * @param {function} onUpdate - Callback for status updates
  * @param {function} onMessage - Callback for incoming messages
+ * @param {string} phoneNumber - Optional phone number for pairing code
  * @returns {object} Socket connection
  */
-async function connect(sessionId, onUpdate, onMessage) {
+async function connect(sessionId, onUpdate, onMessage, phoneNumber = null) {
     if (!require('../utils/validation').isValidId(sessionId)) {
         throw new Error('Invalid session ID');
     }
+
+    // Disconnect existing socket if any
+    disconnect(sessionId);
 
     ensureAuthDir();
 
@@ -62,12 +67,12 @@ async function connect(sessionId, onUpdate, onMessage) {
 
     let state, originalSaveCreds;
     try {
-        console.log(`[${sessionId}] Loading auth state from: ${sessionDir}`);
+        log(`Chargement de l'état d'authentification depuis: ${sessionDir}`, sessionId, { event: 'auth-loading', path: sessionDir }, 'DEBUG');
         const authState = await useMultiFileAuthState(sessionDir);
         state = authState.state;
         originalSaveCreds = authState.saveCreds;
     } catch (err) {
-        console.error(`[${sessionId}] Failed to load auth state:`, err);
+        log(`Échec du chargement de l'état d'authentification: ${err.message}`, sessionId, { event: 'auth-error', error: err.message }, 'ERROR');
         if (onUpdate) onUpdate(sessionId, 'DISCONNECTED', `Auth state error: ${err.message}`, null);
         throw err;
     }
@@ -82,10 +87,10 @@ async function connect(sessionId, onUpdate, onMessage) {
             } catch (err) {
                 retries--;
                 if (err.code === 'EPERM' && retries > 0) {
-                    console.warn(`[${sessionId}] EPERM error saving credentials, retrying... (${retries} left)`);
+                    log(`Erreur EPERM lors de la sauvegarde des identifiants, tentative... (${retries} restantes)`, sessionId, { event: 'auth-save-retry', retries }, 'WARN');
                     await new Promise(resolve => setTimeout(resolve, 200));
                 } else {
-                    console.error(`[${sessionId}] Failed to save credentials:`, err);
+                    log(`Échec de la sauvegarde des identifiants: ${err.message}`, sessionId, { event: 'auth-save-error', error: err.message }, 'ERROR');
                     throw err;
                 }
             }
@@ -97,11 +102,11 @@ async function connect(sessionId, onUpdate, onMessage) {
     try {
         const waVersion = await fetchLatestWaWebVersion({});
         version = waVersion.version;
-        console.log(`[${sessionId}] Using WA Web version: ${version.join('.')}`);
+        log(`Utilisation de la version WA Web: ${version.join('.')}`, sessionId, { event: 'wa-version', version: version.join('.') }, 'DEBUG');
     } catch (e) {
         const baileysVersion = await fetchLatestBaileysVersion();
         version = baileysVersion.version;
-        console.log(`[${sessionId}] Using Baileys version: ${version.join('.')} (fallback)`);
+        log(`Utilisation de la version Baileys: ${version.join('.')} (fallback)`, sessionId, { event: 'baileys-version', version: version.join('.') }, 'DEBUG');
     }
 
     const sock = makeWASocket({
@@ -112,22 +117,62 @@ async function connect(sessionId, onUpdate, onMessage) {
         },
         printQRInTerminal: false,
         logger,
-        browser: ['Super Light WhatsApp', 'Chrome', '1.0.0'],
+        browser: Browsers.ubuntu('Chrome'),
         syncFullHistory: false,
-        qrTimeout: 60000, // Increase timeout to 60s
+        qrTimeout: 60000,
         connectTimeoutMs: 60000,
         keepAliveIntervalMs: 30000,
-        printQRInTerminal: false,
-        logger,
         generateHighQualityLinkPreview: false,
         shouldIgnoreJid: (jid) => isJidBroadcast(jid),
         markOnlineOnConnect: true,
-        defaultQueryTimeoutMs: undefined,
-        getMessage: async () => ({ conversation: 'hello' })
+        linkPreviewImageThumbnailWidth: 192,
+        getMessage: async (key) => {
+            // This helps with message retries
+            return { conversation: 'hello' };
+        },
+        // Performance & Stability Tweaks
+        patchMessageBeforeSending: (message) => {
+            const requiresPatch = !!(
+                message.buttonsMessage ||
+                message.templateMessage ||
+                message.listMessage
+            );
+            if (requiresPatch) {
+                return {
+                    viewOnceMessage: {
+                        message: {
+                            messageContextInfo: {
+                                deviceListMetadata: {},
+                                deviceListMetadataVersion: 2,
+                            },
+                            ...message,
+                        },
+                    },
+                };
+            }
+            return message;
+        },
+        retryRequestDelayMs: 2000,
+        maxMsgRetryCount: 5,
     });
 
     // Store socket reference
     activeSockets.set(sessionId, sock);
+
+    // Handle Pairing Code request if phone number is provided
+    if (phoneNumber && !state.creds.registered) {
+        log(`Demande de code d'appairage pour ${phoneNumber}`, sessionId, { event: 'pairing-code-request', phoneNumber }, 'INFO');
+        setTimeout(async () => {
+            try {
+                const code = await sock.requestPairingCode(phoneNumber);
+                log(`Code d'appairage reçu: ${code}`, sessionId, { event: 'pairing-code-received', code }, 'INFO');
+                if (onUpdate) onUpdate(sessionId, 'GENERATING_CODE', 'Pairing code generated', code);
+            } catch (err) {
+                log(`Erreur lors de la demande du code d'appairage: ${err.message}`, sessionId, { event: 'pairing-code-error', error: err.message }, 'ERROR');
+                if (onUpdate) onUpdate(sessionId, 'DISCONNECTED', `Pairing error: ${err.message}`, null);
+            }
+        }, 3000); // Small delay to ensure socket is ready
+    }
 
     // Handle credentials update
     sock.ev.on('creds.update', saveCreds);
@@ -137,53 +182,79 @@ async function connect(sessionId, onUpdate, onMessage) {
         const { connection, lastDisconnect, qr } = update;
 
         if (qr) {
-            console.log(`[${sessionId}] New QR Code generated: ${qr.substring(0, 30)}...`);
+            log(`Nouveau code QR généré`, sessionId, { event: 'qr-generated' }, 'INFO');
             try {
                 const qrBase64 = await QRCode.toDataURL(qr);
                 if (onUpdate) onUpdate(sessionId, 'GENERATING_QR', 'Scan QR code', qrBase64);
             } catch (err) {
-                console.error(`[${sessionId}] Failed to generate QR DataURL:`, err);
+                log(`Erreur lors de la génération du QR DataURL: ${err.message}`, sessionId, { event: 'qr-error', error: err.message }, 'ERROR');
                 if (onUpdate) onUpdate(sessionId, 'GENERATING_QR', 'Scan QR code', qr);
             }
         }
 
         if (connection === 'connecting') {
+            log(`Connexion en cours...`, sessionId, { event: 'connection-connecting' }, 'INFO');
             if (onUpdate) onUpdate(sessionId, 'CONNECTING', 'Connecting...', null);
         }
 
         if (connection === 'open') {
-            console.log(`[${sessionId}] Connected!`);
-            retryCounters.delete(sessionId);
+        const name = sock.user?.name || 'Unknown';
+        log(`WhatsApp connecté: ${name}`, sessionId, { event: 'connection-open', user: name }, 'INFO');
+        retryCounters.delete(sessionId);
 
-            const name = sock.user?.name || 'Unknown';
-            if (onUpdate) onUpdate(sessionId, 'CONNECTED', `Connected as ${name}`, null);
-        }
+        if (onUpdate) onUpdate(sessionId, 'CONNECTED', `Connected as ${name}`, null);
+    }
 
-        if (connection === 'close') {
-            const statusCode = lastDisconnect?.error?.output?.statusCode;
-            const reason = lastDisconnect?.error?.output?.payload?.message || 'Connection closed';
+    if (connection === 'close') {
+        const statusCode = lastDisconnect?.error?.output?.statusCode;
+        const reason = lastDisconnect?.error?.output?.payload?.message || 'Connection closed';
 
-            console.log(`[${sessionId}] Disconnected: ${statusCode} - ${reason}`);
-            if (onUpdate) onUpdate(sessionId, 'DISCONNECTED', reason, null);
+        log(`WhatsApp disconnected: ${reason} (Code: ${statusCode})`, sessionId, { 
+            event: 'connection-close', 
+            statusCode, 
+            reason 
+        }, statusCode === DisconnectReason.loggedOut ? 'WARN' : 'ERROR');
+        
+        if (onUpdate) onUpdate(sessionId, 'DISCONNECTED', reason, null);
 
             // Handle reconnection logic
-            const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401 && statusCode !== 403;
+            const shouldReconnect = statusCode !== DisconnectReason.loggedOut && 
+                                  statusCode !== 401 && 
+                                  statusCode !== 403 &&
+                                  statusCode !== 440; // Avoid infinite loop on session expired
 
             if (shouldReconnect) {
                 const retryCount = (retryCounters.get(sessionId) || 0) + 1;
                 retryCounters.set(sessionId, retryCount);
 
-                if (retryCount <= 5) {
-                    console.log(`[${sessionId}] Reconnecting... (attempt ${retryCount})`);
-                    setTimeout(() => connect(sessionId, onUpdate, onMessage), 5000);
+                // Exponential backoff for WhatsApp reconnection
+                // Start with shorter delay for network glitches, then increase
+                const delay = Math.min(2000 * Math.pow(2, retryCount - 1), 60000);
+                
+                if (retryCount <= 15) { // Increased to 15 retries for better resilience
+                log(`Reconnexion... (tentative ${retryCount}) dans ${delay}ms`, sessionId, {
+                    event: 'connection-retry',
+                    attempt: retryCount,
+                    delay
+                }, 'INFO');
+                if (onUpdate) onUpdate(sessionId, 'CONNECTING', `Reconnecting (attempt ${retryCount})...`, null);
+                    setTimeout(() => {
+                        // Check if it's still disconnected before trying to connect again
+                        if (!activeSockets.has(sessionId)) {
+                            connect(sessionId, onUpdate, onMessage).catch(err => {
+                                log(`Échec de la tentative de reconnexion ${retryCount}: ${err.message}`, sessionId, { event: 'reconnect-failed', attempt: retryCount, error: err.message }, 'ERROR');
+                            });
+                        }
+                    }, delay);
                 } else {
-                    console.log(`[${sessionId}] Max retries reached`);
+                    log(`Nombre maximum de tentatives de reconnexion atteint`, sessionId, { event: 'reconnect-max-reached' }, 'WARN');
                     retryCounters.delete(sessionId);
+                    if (onUpdate) onUpdate(sessionId, 'DISCONNECTED', 'Max reconnection attempts reached', null);
                 }
             } else {
                 // Clear session data on logout
                 if (statusCode === DisconnectReason.loggedOut || statusCode === 401) {
-                    console.log(`[${sessionId}] Logged out, cleaning session data`);
+                    log(`Déconnexion effectuée, nettoyage des données de session`, sessionId, { event: 'session-cleanup' }, 'INFO');
                     if (fs.existsSync(sessionDir)) {
                         fs.rmSync(sessionDir, { recursive: true, force: true });
                     }
@@ -194,15 +265,65 @@ async function connect(sessionId, onUpdate, onMessage) {
         }
     });
 
+    // Handle participant updates (moderation, welcome, etc.)
+    sock.ev.on('group-participants.update', async (update) => {
+        try {
+            const moderationService = require('./moderation');
+            await moderationService.handleParticipantUpdate(sock, sessionId, update);
+        } catch (err) {
+            log(`Erreur lors du traitement de la mise à jour des participants pour ${sessionId}: ${err.message}`, sessionId, { event: 'participant-update-error', error: err.message }, 'ERROR');
+        }
+    });
+
     // Handle incoming messages
-    if (onMessage) {
-        sock.ev.on('messages.upsert', async (m) => {
-            const msg = m.messages[0];
-            if (!msg.key.fromMe && msg.message) {
+    sock.ev.on('messages.upsert', async (m) => {
+        const msg = m.messages[0];
+        if (!msg.key.fromMe && msg.message) {
+            const remoteJid = msg.key.remoteJid;
+            const isGroup = remoteJid.endsWith('@g.us');
+            
+            log(`Message entrant de ${remoteJid} (${isGroup ? 'Groupe' : 'Direct'})`, sessionId, {
+                event: 'message-received',
+                remoteJid: remoteJid,
+                pushName: msg.pushName,
+                isGroup
+            }, 'INFO');
+            
+            // Call standard message handler if provided
+            if (onMessage) {
                 onMessage(sessionId, msg);
             }
-        });
-    }
+
+            // Call Moderation Handler
+            let blocked = false;
+            try {
+                const moderationService = require('./moderation');
+                blocked = await moderationService.handleIncomingMessage(sock, sessionId, msg);
+            } catch (err) {
+                log(`Erreur de modération pour la session ${sessionId}: ${err.message}`, sessionId, { event: 'moderation-error', error: err.message }, 'ERROR');
+            }
+
+            if (blocked) {
+                log(`Message de ${msg.key.remoteJid} bloqué par la modération`, sessionId, {
+                    event: 'moderation-block',
+                    remoteJid: msg.key.remoteJid
+                }, 'WARN');
+                return;
+            }
+
+            // Call AI Handler if enabled (Personal Bot mode)
+            // Note: Group Assistant is handled inside moderationService.handleIncomingMessage
+            if (!isGroup) {
+                try {
+                    const aiService = require('./ai');
+                    log(`Déclenchement du gestionnaire d'IA personnel pour la session ${sessionId}...`, sessionId, { event: 'ai-trigger' }, 'DEBUG');
+                    await aiService.handleIncomingMessage(sock, sessionId, msg);
+                } catch (err) {
+                    log(`Erreur du gestionnaire d'IA pour la session ${sessionId}: ${err.message}`, sessionId, { event: 'ai-handler-error', error: err.message }, 'ERROR');
+                }
+            }
+        }
+    });
 
     return sock;
 }
