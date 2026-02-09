@@ -4,11 +4,11 @@
   "description": "A super lightweight web server for WhatsApp API using @whiskeysockets/baileys",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
+    "start": "npm run build:frontend && node index.js",
     "dev:backend": "nodemon",
     "dev:frontend": "cd frontend && npm run dev -- -p 3005",
     "dev": "concurrently -k \"npm run dev:backend\" \"npm run dev:frontend\"",
-    "build:frontend": "cd frontend && npm run build",
+    "build:frontend": "cd frontend && npm install && npm run build",
     "install:all": "npm install && cd frontend && npm install",
     "test": "jest",
     "start-production": "npm run start:prod",
