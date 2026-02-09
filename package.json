@@ -9,6 +9,7 @@
     "dev:frontend": "cd frontend && npm run dev -- -p 3005",
     "dev": "concurrently -k \"npm run dev:backend\" \"npm run dev:frontend\"",
     "build:frontend": "cd frontend && npm run build",
+    "build": "npm run build:frontend",
     "install:all": "npm install && cd frontend && npm install",
     "test": "jest",
     "start-production": "npm run start:prod",

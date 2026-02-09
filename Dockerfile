@@ -25,19 +25,39 @@ RUN apt-get update && apt-get install -y \
 # Set working directory
 WORKDIR /app
 
-# Copy package files
+# Copy package files for both backend and frontend
 COPY package*.json ./
+COPY frontend/package*.json ./frontend/
 
-# Install dependencies (including devDependencies for build if needed, then prune)
+# Install dependencies for both
 RUN npm install --legacy-peer-deps
+RUN cd frontend && npm install --legacy-peer-deps
 
 # Copy application source
 COPY . .
 
+# Argument for Frontend Build (important for Next.js static export)
+ARG NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
+ARG NEXT_PUBLIC_CLERK_SIGN_IN_URL
+ARG NEXT_PUBLIC_CLERK_SIGN_UP_URL
+ARG NEXT_PUBLIC_API_URL
+
+ENV NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=$NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
+ENV NEXT_PUBLIC_CLERK_SIGN_IN_URL=$NEXT_PUBLIC_CLERK_SIGN_IN_URL
+ENV NEXT_PUBLIC_CLERK_SIGN_UP_URL=$NEXT_PUBLIC_CLERK_SIGN_UP_URL
+ENV NEXT_PUBLIC_API_URL=$NEXT_PUBLIC_API_URL
+
+# Build the frontend
+RUN cd frontend && npm run build
+
 # Create required directories for persistence
 RUN mkdir -p logs sessions media auth_info_baileys data src/config
 
-# Expose the API port
+# Cleanup frontend source to save space (keep only the 'out' directory)
+# We keep the frontend/out directory because the backend will serve it
+RUN find frontend -mindepth 1 -maxdepth 1 ! -name 'out' -exec rm -rf {} +
+
+# Expose the API port (which now also serves the UI)
 EXPOSE 3000
 
 # Start the application

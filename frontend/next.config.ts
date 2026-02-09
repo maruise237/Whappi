@@ -1,6 +1,10 @@
 import type { NextConfig } from "next";
 const nextConfig: NextConfig = {
-  output: 'standalone',
+  output: 'export',
+  distDir: 'out',
+  images: {
+    unoptimized: true,
+  },
   async redirects() {
     return [
       {
