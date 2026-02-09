@@ -579,9 +579,11 @@ AIModel.ensureDefaultDeepSeek();
 
 // Start server
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-    log(`Serveur en cours d'exécution sur le port ${PORT}`, 'SYSTEM', { port: PORT }, 'INFO');
-    log(`Tableau de bord: http://localhost:${PORT}`, 'SYSTEM', { url: `http://localhost:${PORT}` }, 'INFO');
+const HOST = process.env.HOST || '0.0.0.0';
+
+server.listen(PORT, HOST, () => {
+    log(`Serveur en cours d'exécution sur le port ${PORT}`, 'SYSTEM', { port: PORT, host: HOST }, 'INFO');
+    log(`Tableau de bord: http://${HOST}:${PORT}`, 'SYSTEM', { url: `http://${HOST}:${PORT}` }, 'INFO');
 });
 
 // Graceful shutdown
