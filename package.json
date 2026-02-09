@@ -8,8 +8,8 @@
     "dev:backend": "nodemon",
     "dev:frontend": "cd frontend && npm run dev -- -p 3005",
     "dev": "concurrently -k \"npm run dev:backend\" \"npm run dev:frontend\"",
-    "build:frontend": "cd frontend && npm install && npm run build",
-    "install:all": "npm install && cd frontend && npm install",
+    "build:frontend": "cd frontend && npm install --legacy-peer-deps && npm run build",
+    "install:all": "npm install && cd frontend && npm install --legacy-peer-deps",
     "test": "jest",
     "start-production": "npm run start:prod",
     "start:prod": "node -r dotenv/config index.js"
