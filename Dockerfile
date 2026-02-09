@@ -29,7 +29,7 @@ WORKDIR /app
 COPY package*.json ./
 
 # Install dependencies (including devDependencies for build if needed, then prune)
-RUN npm install
+RUN npm install --legacy-peer-deps
 
 # Copy application source
 COPY . .
