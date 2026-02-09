@@ -53,12 +53,8 @@ RUN cd frontend && npm run build
 # Create required directories for persistence
 RUN mkdir -p logs sessions media auth_info_baileys data src/config
 
-# Cleanup frontend source to save space (keep only the 'out' directory)
-# We keep the frontend/out directory because the backend will serve it
-RUN find frontend -mindepth 1 -maxdepth 1 ! -name 'out' -exec rm -rf {} +
-
 # Expose the API port (which now also serves the UI)
 EXPOSE 3000
 
 # Start the application
-CMD ["npm", "run", "start"]
+CMD ["npm", "run", "start:prod"]

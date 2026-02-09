@@ -463,79 +463,56 @@ const apiRouter = initializeApi(
     triggerQRWrapper
 );
 
+const { createProxyMiddleware } = require('http-proxy-middleware');
+
+// ... existing code ...
+
 // Mount routes
 app.use('/webhooks', webhookRoutes);
 app.use('/admin/users', userRoutes);
 
 app.use('/api/v1', apiRouter);
 
-// Serve modern UI
-const frontendPath = path.join(__dirname, 'frontend', 'out');
-
-if (fs.existsSync(frontendPath)) {
-    // 1. Serve _next/static explicitly with long-term caching
-    // Fix: Map /_next/static to frontend/out/_next/static
-    app.use('/_next/static', express.static(path.join(frontendPath, '_next', 'static'), {
-        maxAge: '1y',
-        immutable: true,
-        fallthrough: false // Fail if not found to avoid falling back to index.html for assets
-    }));
-
-    // 2. Serve other static files
-    app.use(express.static(frontendPath, {
-        extensions: ['html'],
-        index: 'index.html'
-    }));
-
-    // 3. Fallback to index.html for SPA routing
-    app.get('*', (req, res, next) => {
-        // Skip for API routes
-        if (req.path.startsWith('/api') || req.path.startsWith('/admin')) {
-            return next();
-        }
-        res.sendFile(path.join(frontendPath, 'index.html'));
-    });
-} else {
-    app.get('/', (req, res) => {
-        res.status(200).send(`
-            <!DOCTYPE html>
-            <html>
-            <head>
-                <title>Whappi API Server</title>
-                <style>
-                    body { font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f4f4f9; }
-                    .card { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: center; max-width: 500px; }
-                    h1 { color: #25d366; }
-                    p { color: #666; line-height: 1.6; }
-                    .status { display: inline-block; padding: 0.5rem 1rem; background: #e8f5e9; color: #2e7d32; border-radius: 20px; font-weight: bold; margin-bottom: 1rem; }
-                    .links { margin-top: 2rem; display: flex; gap: 1rem; justify-content: center; }
-                    a { color: #007bff; text-decoration: none; font-weight: bold; }
-                    a:hover { text-decoration: underline; }
-                </style>
-            </head>
-            <body>
-                <div class="card">
-                    <div class="status">● Serveur Online</div>
-                    <h1>Whappi API Server</h1>
-                    <p>Le serveur backend est opérationnel et prêt à gérer vos sessions WhatsApp.</p>
-                    <p><strong>Note :</strong> L'interface d'administration est hébergée séparément sur le port 3001 ou via votre domaine configuré.</p>
-                    <div class="links">
-                        <a href="/api/v1/health" target="_blank">Santé API</a>
-                        <a href="http://${req.hostname}:3001" id="dashLink">Accéder au Dashboard</a>
+// Proxy to Frontend (Next.js)
+app.use('/', createProxyMiddleware({
+    target: 'http://localhost:3001',
+    changeOrigin: true,
+    ws: true, // Support WebSockets for Next.js HMR/Live reload if needed
+    onError: (err, req, res) => {
+        // If frontend is not ready yet or fails, show a friendly message
+        if (req.path === '/' || req.path === '') {
+            res.status(200).send(`
+                <!DOCTYPE html>
+                <html>
+                <head>
+                    <title>Whappi API Server</title>
+                    <style>
+                        body { font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f4f4f9; }
+                        .card { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: center; max-width: 500px; }
+                        h1 { color: #25d366; }
+                        p { color: #666; line-height: 1.6; }
+                        .status { display: inline-block; padding: 0.5rem 1rem; background: #fff3e0; color: #ef6c00; border-radius: 20px; font-weight: bold; margin-bottom: 1rem; }
+                        .loader { border: 4px solid #f3f3f3; border-top: 4px solid #25d366; border-radius: 50%; width: 30px; height: 30px; animation: spin 2s linear infinite; margin: 1rem auto; }
+                        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+                    </style>
+                </head>
+                <body>
+                    <div class="card">
+                        <div class="status">● Initialisation du Dashboard...</div>
+                        <h1>Whappi</h1>
+                        <p>Le backend est prêt. Le dashboard est en cours de chargement (cela peut prendre 30-60 secondes lors du premier démarrage).</p>
+                        <div class="loader"></div>
+                        <p><small>Actualisation automatique dans 5 secondes...</small></p>
+                        <script>setTimeout(() => window.location.reload(), 5000);</script>
                     </div>
-                </div>
-                <script>
-                    // Si on est en production sur un domaine, le port 3001 n'est peut-être pas ouvert directement
-                    // On adapte le lien si besoin
-                    if (!window.location.port) {
-                        document.getElementById('dashLink').innerText = 'Accéder au Dashboard (via votre domaine)';
-                    }
-                </script>
-            </body>
-            </html>
-        `);
-    });
-}
+                </body>
+                </html>
+            `);
+        } else {
+            res.status(503).json({ status: 'error', message: 'Frontend service temporarily unavailable' });
+        }
+    }
+}));
 
 // Error handlers
 app.use(notFoundHandler);
