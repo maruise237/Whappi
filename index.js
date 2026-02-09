@@ -58,6 +58,17 @@ if (!ENCRYPTION_KEY || !isValidKey(ENCRYPTION_KEY)) {
 const app = express();
 app.set('trust proxy', 1);
 
+// Security Check for Clerk
+log('Vérification des clés de sécurité...', 'SYSTEM');
+if (!process.env.NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY) {
+    log('ATTENTION: NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY est manquante ! Le Dashboard ne fonctionnera pas.', 'SYSTEM', null, 'ERROR');
+} else {
+    log('Clé Clerk Publishable détectée.', 'SYSTEM');
+}
+if (!process.env.CLERK_SECRET_KEY) {
+    log('ATTENTION: CLERK_SECRET_KEY est manquante ! La connexion échouera.', 'SYSTEM', null, 'ERROR');
+}
+
 // CORS configuration
 app.use(cors({
     origin: (origin, callback) => {
