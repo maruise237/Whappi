@@ -497,11 +497,43 @@ if (fs.existsSync(frontendPath)) {
     });
 } else {
     app.get('/', (req, res) => {
-        res.status(200).json({ 
-            status: 'online', 
-            message: 'Whappi API Server is running.',
-            frontend: 'Not found in /frontend/out. Please build it with "npm run build".'
-        });
+        res.status(200).send(`
+            <!DOCTYPE html>
+            <html>
+            <head>
+                <title>Whappi API Server</title>
+                <style>
+                    body { font-family: sans-serif; display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; background: #f4f4f9; }
+                    .card { background: white; padding: 2rem; border-radius: 8px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); text-align: center; max-width: 500px; }
+                    h1 { color: #25d366; }
+                    p { color: #666; line-height: 1.6; }
+                    .status { display: inline-block; padding: 0.5rem 1rem; background: #e8f5e9; color: #2e7d32; border-radius: 20px; font-weight: bold; margin-bottom: 1rem; }
+                    .links { margin-top: 2rem; display: flex; gap: 1rem; justify-content: center; }
+                    a { color: #007bff; text-decoration: none; font-weight: bold; }
+                    a:hover { text-decoration: underline; }
+                </style>
+            </head>
+            <body>
+                <div class="card">
+                    <div class="status">● Serveur Online</div>
+                    <h1>Whappi API Server</h1>
+                    <p>Le serveur backend est opérationnel et prêt à gérer vos sessions WhatsApp.</p>
+                    <p><strong>Note :</strong> L'interface d'administration est hébergée séparément sur le port 3001 ou via votre domaine configuré.</p>
+                    <div class="links">
+                        <a href="/api/v1/health" target="_blank">Santé API</a>
+                        <a href="http://${req.hostname}:3001" id="dashLink">Accéder au Dashboard</a>
+                    </div>
+                </div>
+                <script>
+                    // Si on est en production sur un domaine, le port 3001 n'est peut-être pas ouvert directement
+                    // On adapte le lien si besoin
+                    if (!window.location.port) {
+                        document.getElementById('dashLink').innerText = 'Accéder au Dashboard (via votre domaine)';
+                    }
+                </script>
+            </body>
+            </html>
+        `);
     });
 }
 
