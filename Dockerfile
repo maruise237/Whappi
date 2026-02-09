@@ -36,11 +36,11 @@ RUN cd frontend && npm install --legacy-peer-deps
 # Copy application source
 COPY . .
 
-# Argument for Frontend Build (important for Next.js static export)
-ARG NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
-ARG NEXT_PUBLIC_CLERK_SIGN_IN_URL
-ARG NEXT_PUBLIC_CLERK_SIGN_UP_URL
-ARG NEXT_PUBLIC_API_URL
+# Argument for Frontend Build (important for Next.js)
+ARG NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY="pk_test_build_time_placeholder"
+ARG NEXT_PUBLIC_CLERK_SIGN_IN_URL="/login"
+ARG NEXT_PUBLIC_CLERK_SIGN_UP_URL="/register"
+ARG NEXT_PUBLIC_API_URL="/"
 
 ENV NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY=$NEXT_PUBLIC_CLERK_PUBLISHABLE_KEY
 ENV NEXT_PUBLIC_CLERK_SIGN_IN_URL=$NEXT_PUBLIC_CLERK_SIGN_IN_URL
