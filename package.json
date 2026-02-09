@@ -16,6 +16,9 @@
   },
   "author": "Alucard0x1",
   "license": "MIT",
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "dependencies": {
     "@clerk/clerk-sdk-node": "^4.13.23",
     "@hapi/boom": "^10.0.1",
