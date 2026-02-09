@@ -13,7 +13,7 @@
     "install:all": "npm install && cd frontend && npm install",
     "test": "jest",
     "start-production": "npm run start:prod",
-    "start:frontend": "cd frontend && PORT=3001 node .next/standalone/server.js",
+    "start:frontend": "cd frontend && npm run start -- -p 3001 -H 127.0.0.1",
     "start:prod": "concurrently -k \"node index.js\" \"npm run start:frontend\""
   },
   "author": "Alucard0x1",

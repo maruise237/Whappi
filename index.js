@@ -475,7 +475,7 @@ app.use('/api/v1', apiRouter);
 
 // Proxy to Frontend (Next.js)
 app.use('/', createProxyMiddleware({
-    target: 'http://localhost:3001',
+    target: 'http://127.0.0.1:3001',
     changeOrigin: true,
     ws: true, // Support WebSockets for Next.js HMR/Live reload if needed
     onError: (err, req, res) => {
